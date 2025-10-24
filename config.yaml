@@ -1,0 +1,44 @@
+# Example configuration for clump_finder
+
+# Input/output
+dataset_path: ./parthenon.opmd.00000.bp/
+step: 0
+output_dir: ./clump_out
+log_dir: ./logs
+
+# Selection (code units)
+temperature_threshold: 1.0
+connectivity: 6                        # 6 | 18 | 26
+
+# Geometry (cubic grid)
+Nres: 256
+dx: null
+dy: null
+dz: null
+origin: [0.0, 0.0, 0.0]
+periodic: [true, true, true]
+
+# Parallelism
+intra_node_threads: 56
+mpi_mode: "one_rank_per_node"
+verify_one_rank_per_node: true
+
+# Tiling inside a node (not the MPI split)
+tile_shape: [128, 128, 128]
+
+# Memory / precision
+field_dtype: float32
+accum_dtype: float64
+
+# Output content
+save_pressure: false
+save_per_clump_voxel_bbox: true
+
+# Stitching
+emit_halo: true
+stitch_flag: false
+
+# Misc
+gamma: 1.6666666666666667
+profile: false
+

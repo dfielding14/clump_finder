@@ -1,0 +1,7 @@
+numpy>=1.23
+numba>=0.58
+mpi4py
+pyyaml
+tqdm
+openpmd-api
+matplotlib

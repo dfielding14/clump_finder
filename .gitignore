@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Outputs
+clump_out/
+logs/
+*.npz
+*.png
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual envs
+venv/
+.venv/
+
