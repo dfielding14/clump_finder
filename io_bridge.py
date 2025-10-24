@@ -57,7 +57,8 @@ class IOConfig:
     - step: iteration index to read from the series
     - gamma: ratio of specific heats, used for temperature computation
     - field_dtype: dtype for returned arrays (float32 recommended to limit memory)
-    - emit_halo: if True, include a 1-cell halo on each face (periodic wrap-around)
+    - ghost_width: integer count of ghost zones to include on each face (0 or 1). Ghosts are
+      filled from neighboring domain cells with periodic wrap at the global domain boundary.
     - level_suffix: optional explicit suffix for record names (e.g., "lvl5"). If None, auto-detect.
     """
 
@@ -65,7 +66,7 @@ class IOConfig:
     step: int
     gamma: float = 5.0 / 3.0
     field_dtype: np.dtype = np.float32
-    emit_halo: bool = True
+    ghost_width: int = 1
     level_suffix: Optional[str] = None
 
 
@@ -193,7 +194,7 @@ def load_subvolume(
           'vy':    vely,
           'vz':    velz,
         }
-        ni'/nj'/nk' include halo cells if cfg.emit_halo is True.
+        ni'/nj'/nk' include ghost cells if cfg.ghost_width > 0.
     """
     (ib0, ib1), (jb0, jb1), (kb0, kb1) = node_bbox
 
@@ -201,7 +202,7 @@ def load_subvolume(
     level_suffix = cfg.level_suffix or _detect_level_suffix(it)
     Nz, Ny, Nx = _domain_shape(it, level_suffix)
 
-    halo = 1 if cfg.emit_halo else 0
+    halo = int(max(0, cfg.ghost_width))
     ni, nj, nk = (ib1 - ib0), (jb1 - jb0), (kb1 - kb0)
     ni_t, nj_t, nk_t = ni + 2 * halo, nj + 2 * halo, nk + 2 * halo
 
@@ -282,4 +283,3 @@ def query_domain_shape(dataset_path: str, step: int, level_suffix: Optional[str]
     shape = _domain_shape(it, lvl)
     series.flush()
     return (shape, lvl)
-

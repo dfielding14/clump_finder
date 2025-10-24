@@ -7,7 +7,7 @@
 * **Scale:** Target up to ~10,000³ overall, but baseline runs one **~1,000³ subvolume per node** (as stated).
 * **Parallelism:** One **MPI rank per node**, with **56 CPU threads** inside the rank for intra‑node acceleration (shared memory). (Alternative per‑core MPI mode is supported but optional.)
 * **Connectivity:** Default **6‑connected** (face neighbors) to match “exterior faces” interpretation and to align with skimage’s `connectivity=1` in 3‑D.
-* **Data I/O & units:** Use `clump_finder/io_bridge.py` (openPMD) to read datasets directly (based on your examples). It returns `dens,temp,velx,vely,velz` in code units; halos wrap periodically.
+* **Data I/O & units:** Use `clump_finder/io_bridge.py` (openPMD) to read datasets directly (based on your examples). It returns `dens,temp,velx,vely,velz` in code units; optional ghost zones are read from neighboring domain cells with periodic wrap at the global domain boundary (not across subvolume edges).
 * **Outputs:** Per‑node `.npz` files + a master combined `.npz`. Per‑clump metrics include volume, mass, surface area (exposed faces), mass/volume‑weighted centroids, and descriptive stats (mean/std/skew/kurtosis) for `rho, T, vx, vy, vz, pressure` (with `pressure = rho * T` in your units).
 * **Scheduler:** Provide a **SLURM job script** for Frontier (you will supply site examples; we include a clean template to adapt).
 
@@ -25,14 +25,14 @@ clump_finder/
 ├── local_label.py                          # node-local 3D connected components (Numba)
 ├── metrics.py                              # per-label reductions, centroids, shapes, area
 ├── stitch.py                               # (future) cross-node merge design + helpers (feature-flagged)
-├── io_bridge.py                            # openPMD I/O wrapper (code units; periodic halos)
+├── io_bridge.py                            # openPMD I/O wrapper (code units; optional ghost zones)
 ├── aggregate_results.py                    # reduces per-node .npz into one master .npz
 ├── slurm/
 │   └── frontier_clump.sbatch               # SLURM template for Frontier (site lines TBD)
 └── requirements.txt                        # likely unused (env already provisioned)
 ```
 
-> **Important (updated):** `io_bridge.py` is implemented using `openpmd-api` directly (based on your provided snippets). It returns `dens`, `temp`, `velx`, `vely`, `velz` in code units. Dataset axis order is `[nz,ny,nx]` and outputs are `[i,j,k]` with `i→x`, `j→y`, `k→z`. Optional halos wrap around periodically (no clamping/zeros).
+> **Important (updated):** `io_bridge.py` is implemented using `openpmd-api` directly (based on your provided snippets). It returns `dens`, `temp`, `velx`, `vely`, `velz` in code units. Dataset axis order is `[nz,ny,nx]` and outputs are `[i,j,k]` with `i→x`, `j→y`, `k→z`. Optional ghost zones overlap neighbor subvolumes and wrap at the global domain boundary only (no local subvolume wrap or clamping/zeros).
 
 ---
 
@@ -77,7 +77,7 @@ save_pressure: false                   # compute pressure on-the-fly as rho*T; d
 save_per_clump_voxel_bbox: true       # store i/j/k min/max per clump (helps future stitching)
 
 # Future stitching
-emit_halo: true                        # extend read by 1-cell halo (periodic wrap-around)
+ghost_width: 1                         # include 1-cell ghost zones; wrap at global domain edges only
 stitch_flag: false                     # baseline off (no cross-node merging)
 
 # Misc
@@ -105,12 +105,12 @@ def load_subvolume(node_bbox, cfg):
         'velz': (ni, nj, nk),
         # Aliases also provided: rho->dens, T->temp, vx->velx, vy->vely, vz->velz
       }
-    Values are in code units. If cfg.emit_halo is True, include a 1‑cell halo
+    Values are in code units. If cfg.ghost_width > 0, include ghost zones (1 cell) per face
     on all faces with periodic wrap-around.
     """
 ```
 
-* Keep memory in check: **load only the subvolume assigned to this node**, plus an optional **1‑cell halo** on each face if `emit_halo=true` (periodic wrap-around).
+* Keep memory in check: **load only the subvolume assigned to this node**, plus optional **ghost zones** (1 cell per face if `ghost_width=1`), filled from neighboring domain cells (wrap only at global edges).
 * All outputs are in code units (no external unit conversion here).
 
 ---
@@ -318,7 +318,7 @@ srun -N ${SLURM_NNODES} -n ${SLURM_NNODES} \
 
 Per rank (node):
 
-1. **Load subvolume** via `io_bridge.load_subvolume(node_bbox, cfg)` (optionally with 1‑cell halo; halos wrap around periodically). Returns `dens,temp,velx,vely,velz` in code units.
+1. **Load subvolume** via `io_bridge.load_subvolume(node_bbox, cfg)` (optionally with ghost zones; ghost cells overlap with neighbors and wrap at global domain edges only). Returns `dens,temp,velx,vely,velz` in code units.
 2. **Threshold**: `M = T < threshold`.
 3. **Tile** the subvolume (internal bricks).
 4. **Local labeling** (`local_label.label_3d`): returns compacted `labels` with `K` clumps.
@@ -364,15 +364,15 @@ def uf_union(parent, a, b):
 
 def label_3d(mask, tile_shape=(128,128,128)):
     """
-    mask: boolean 3-D array (C-order), halo included if present.
-    Returns labels (uint32) compacted to 1..K on the **interior** (exclude halo in output).
+    mask: boolean 3-D array (C-order), ghost zones included if present.
+    Returns labels (uint32) compacted to 1..K on the **interior** (exclude ghost zones in output).
     """
     # 1) split into tiles
     # 2) Numba-parallel first pass per tile with local uf
     # 3) collect boundary equivalences, then global uf merge
     # 4) second pass: remap to representatives
     # 5) compact labels -> 1..K (using unique + inverse or a dictionary)
-    # 6) drop halo and return labels
+    # 6) drop ghost zones and return labels
     ...
 ```
 
@@ -504,7 +504,7 @@ def exposed_area(labels, dx, dy, dz):
 
 Not required for baseline, but prepare for later:
 
-1. **Halo strategy:** Read **1‑cell halos** at node boundaries. Keep a mapping from **interior labels** to any touching **halo labels** along each of the 6 faces.
+1. **Ghost zone strategy:** Read **1‑cell ghost zones** at node boundaries. Keep a mapping from **interior labels** to any touching **ghost labels** along each of the 6 faces.
 2. **Boundary adjacency export:** For each face that abuts a neighbor node, write `(rank, local_label, face_id, face_coords)` pairs where the clump touches the boundary.
 3. **Distributed union‑find:** Rank 0 collects adjacency edges `(rankA,labelA) ~ (rankB,labelB)`, computes global components (DSU), broadcasts a **global relabel map**.
 4. **Relabel & re‑reduce:** Either (a) re‑scan nodes and re‑reduce using global ids, or (b) reduce locally and then **merge clump rows** that share a global id (merging stats additively using sufficient statistics).

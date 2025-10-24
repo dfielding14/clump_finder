@@ -105,7 +105,7 @@ def main():
         step=int(cfg.get("step", 0)),
         gamma=float(cfg.get("gamma", 5.0 / 3.0)),
         field_dtype=np.dtype(cfg.get("field_dtype", "float32")),
-        emit_halo=bool(cfg.get("emit_halo", True)),
+        ghost_width=int(cfg.get("ghost_width", 1)),
         level_suffix=None,
     )
 
@@ -117,7 +117,7 @@ def main():
     velx = fields["velx"]
     vely = fields["vely"]
     velz = fields["velz"]
-    halo = 1 if io_cfg.emit_halo else 0
+    halo = int(max(0, io_cfg.ghost_width))
     s = slice(halo, -halo if halo > 0 else None)
     dens_i = dens[s, s, s]
     temp_i = temp[s, s, s]

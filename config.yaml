@@ -34,11 +34,10 @@ accum_dtype: float64
 save_pressure: false
 save_per_clump_voxel_bbox: true
 
-# Stitching
-emit_halo: true
+# Ghost zones (0 or 1): include ghost cells from neighboring domain regions; wrap at global domain edges only
+ghost_width: 1
 stitch_flag: false
 
 # Misc
 gamma: 1.6666666666666667
 profile: false
-

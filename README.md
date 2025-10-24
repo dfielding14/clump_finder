@@ -67,7 +67,7 @@ sbatch slurm/frontier_clump.sbatch
 - temperature_threshold (code units)
 - connectivity: 6|18|26 (default: 6)
 - tile_shape: [128,128,128]
-- emit_halo: true (periodic wrap halo)
+- ghost_width: 1 (include ghost zones from neighbors; wrap at global domain edges only)
 - field_dtype: float32, accum_dtype: float64
 - assert_nres_from_data: true|false
 - verify_one_rank_per_node: true|false
@@ -82,4 +82,3 @@ sbatch slurm/frontier_clump.sbatch
 - Pressure is computed on the fly as rho*T (code units).
 - Memory at scale: label array ~4 bytes/cell; consider streaming stats for very large runs.
 - Future: cross-node stitching is stubbed in `stitch.py`.
-
