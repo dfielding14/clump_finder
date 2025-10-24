@@ -172,7 +172,34 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
     fig.savefig(os.path.join(outdir, f"{base}_size_vs_vdisp.png"), bbox_inches='tight')
     plt.close(fig)
 
-    # Per-component std plots removed; only total dispersion shown.
+    # 3) Area vs size joint distribution
+    area = d.get('area')
+    volume_for_area = d.get('volume')
+    if area is not None and volume_for_area is not None:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+        vol = volume_for_area.astype(np.float64, copy=False)
+        pos = vol > 0
+        vol = vol[pos]
+        area_pos = area[pos]
+        if vol.size == 0:
+            ax.text(0.5, 0.5, "No data", ha='center', va='center')
+        else:
+            ratio = area_pos / np.power(vol, 2.0 / 3.0)
+            # Filter out non-positive ratios before log scaling
+            mask = ratio > 0
+            vol = vol[mask]
+            ratio = ratio[mask]
+            if vol.size == 0 or ratio.size == 0:
+                ax.text(0.5, 0.5, "No data", ha='center', va='center')
+            else:
+                lo = np.nanmin(vol)
+                hi = np.nanmax(vol)
+                xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
+                _hist2d(ax, vol, ratio, bins=100, xlog=True, ylog=True,
+                        xlabel='clump volume', ylabel='area / volume$^{2/3}$', xedges=xedges)
+        ax.set_title('Normalized area vs volume')
+        fig.savefig(os.path.join(outdir, f"{base}_area_over_vol23_vs_volume.png"), bbox_inches='tight')
+        plt.close(fig)
 
     print(f"Wrote PNGs to {outdir}")
 

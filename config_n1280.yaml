@@ -1,18 +1,18 @@
-# Example configuration for clump_finder
+# Configuration for clump finder on the n1280 dataset
 
 # Input/output
-dataset_path: /lustre/orion/ast207/proj-shared/mpturb/clumpn640/parthenon.opmd.00035.bp/
+dataset_path: /lustre/orion/ast207/proj-shared/mpturb/clumpn1280/parthenon.opmd.00035.bp/
 step: 35
-output_dir: ./clump_out/clumpn640_step35
+output_dir: ./clump_out/clumpn1280_step35
 log_dir: ./logs
 
 # Selection (code units)
 temperature_threshold: 0.1
-connectivity: 6                        # 6 | 18 | 26
-min_clump_cells: 64                    # ignore clumps smaller than this cell count
+connectivity: 6
+min_clump_cells: 64
 
 # Geometry (cubic grid)
-Nres: 640
+Nres: 1280
 dx: null
 dy: null
 dz: null
@@ -25,8 +25,8 @@ intra_node_threads: 56
 mpi_mode: "one_rank_per_node"
 verify_one_rank_per_node: true
 
-# Tiling inside a node (not the MPI split)
-tile_shape: [640, 640, 640]
+# Tiling inside a node (single tile covering the full domain)
+tile_shape: [1280, 1280, 1280]
 
 # Memory / precision
 field_dtype: float32
@@ -36,7 +36,7 @@ accum_dtype: float64
 save_pressure: false
 save_per_clump_voxel_bbox: true
 
-# Ghost zones (0 or 1): include ghost cells from neighboring domain regions; wrap at global domain edges only
+# Ghost zones
 ghost_width: 1
 stitch_flag: false
 

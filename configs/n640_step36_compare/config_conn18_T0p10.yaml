@@ -1,0 +1,36 @@
+# Clump finder configuration: n640 dataset, step 36, connectivity 18, T < 0.1
+
+dataset_path: /lustre/orion/ast207/proj-shared/mpturb/clumpn640/parthenon.opmd.00036.bp/
+step: 36
+output_dir: ./clump_out/n640_step36/conn18_T0p10
+log_dir: ./logs/n640_step36/conn18_T0p10
+
+temperature_threshold: 0.1
+connectivity: 18
+min_clump_cells: 64
+
+Nres: 640
+dx: null
+dy: null
+dz: null
+origin: [0.0, 0.0, 0.0]
+periodic: [true, true, true]
+assert_nres_from_data: true
+
+intra_node_threads: 56
+mpi_mode: "one_rank_per_node"
+verify_one_rank_per_node: true
+
+tile_shape: [640, 640, 640]
+
+field_dtype: float32
+accum_dtype: float64
+
+save_pressure: false
+save_per_clump_voxel_bbox: true
+
+ghost_width: 1
+stitch_flag: false
+
+gamma: 1.6666666666666667
+profile: false

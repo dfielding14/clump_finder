@@ -284,12 +284,40 @@ def main():
     # Bounding boxes (global indices, [min,max))
     bbox_ijk = M.compute_bboxes(labels, node_bbox, K=K)
 
+    # Filter out clumps smaller than the configured minimum cell count
+    min_cells = int(cfg.get("min_clump_cells", 64))
+    K_orig = cell_count.shape[0]
+    if K_orig:
+        keep = cell_count >= min_cells
+        dropped = int((~keep).sum())
+        if dropped > 0:
+            print(f"rank={rank} dropping {dropped} clumps smaller than {min_cells} cells")
+    else:
+        keep = np.zeros(0, dtype=bool)
+
+    cell_count = cell_count[keep]
+    vol = vol[keep]
+    mass = mass[keep]
+    area = area[keep]
+    cvol = cvol[keep]
+    cmass = cmass[keep]
+    principal_axes_lengths = principal_axes_lengths[keep]
+    axis_ratios = axis_ratios[keep]
+    orientation = orientation[keep]
+    bbox_ijk = bbox_ijk[keep]
+    stats = {
+        k: (v[keep] if isinstance(v, np.ndarray) and v.shape[:1] == (K_orig,) else v)
+        for k, v in stats.items()
+    }
+
+    K = int(cell_count.shape[0])
+
     # Prepare output
     out_dir = cfg.get("output_dir", "./clump_out")
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(cfg.get("log_dir", "./logs"), exist_ok=True)
 
-    rank_ids = np.arange(1, K + 1, dtype=np.int32)
+    rank_ids = np.arange(1, K_orig + 1, dtype=np.int32)[keep]
     out = {
         "label_ids": rank_ids,
         "cell_count": cell_count,
@@ -315,6 +343,8 @@ def main():
 
     part_path = os.path.join(out_dir, f"clumps_rank{rank:05d}.npz")
     np.savez(part_path, **out)
+
+    t_done = time.time()
 
     # Write per-rank metadata sidecar (JSON)
     import json, subprocess
@@ -356,7 +386,6 @@ def main():
     with open(os.path.join(out_dir, f"clumps_rank{rank:05d}.meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    t_done = time.time()
     if rank == 0 or cfg.get("profile", False) or args.profile:
         print(f"rank={rank} times: load={t_load-t0:.2f}s label={t_label-t_load:.2f}s reduce={t_done-t_label:.2f}s K={K}")
 

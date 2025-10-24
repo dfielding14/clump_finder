@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH -J clumpn640_cf
+#SBATCH -J clumpn1280_cf
 #SBATCH -A AST207
 #SBATCH -p batch
-#SBATCH --qos debug
 #SBATCH --qos debug
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=56
-#SBATCH -t 00:30:00
+#SBATCH -t 02:00:00
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -21,10 +20,10 @@ PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "${PROJECT_ROOT}"
 
 mkdir -p logs
-mkdir -p clump_out/clumpn640_step35
+mkdir -p clump_out/clumpn1280_step35
 
 echo "======================================"
-echo "Clump finder run starting at $(date)"
+echo "Clump finder run (n1280) starting at $(date)"
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Nodes : ${SLURM_NNODES}"
 echo "Tasks : ${SLURM_NTASKS}"
@@ -32,8 +31,7 @@ echo "CPUs  : ${SLURM_CPUS_PER_TASK}"
 echo "Python: $(which python)"
 python --version
 echo "Workdir: ${PWD}"
-echo "Project root: ${PROJECT_ROOT}"
-echo "Config : ${CONF:-config.yaml}"
+echo "Config : ${CONF:-config_n1280.yaml}"
 echo "======================================"
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
@@ -43,8 +41,8 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export MPICH_OFI_NIC_POLICY=BLOCK
 
-CONF=${CONF:-config.yaml}
-OUT_DIR="clump_out/clumpn640_step35"
+CONF=${CONF:-config_n1280.yaml}
+OUT_DIR="clump_out/clumpn1280_step35"
 MASTER_NPZ="${OUT_DIR}/clumps_master.npz"
 MASTER_JSON="${OUT_DIR}/clumps_master.meta.json"
 
