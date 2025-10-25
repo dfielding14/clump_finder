@@ -9,7 +9,7 @@ log_dir: ./logs
 # Selection (code units)
 temperature_threshold: 0.1
 connectivity: 6
-min_clump_cells: 64
+min_clump_cells: 27
 
 # Geometry (cubic grid)
 Nres: 1280

@@ -7,7 +7,7 @@ log_dir: ./logs/n640_step36/conn6_T0p10
 
 temperature_threshold: 0.1
 connectivity: 6
-min_clump_cells: 64
+min_clump_cells: 27
 
 Nres: 640
 dx: null
