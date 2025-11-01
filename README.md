@@ -10,7 +10,7 @@ The driver follows a simple but memory‑aware pipeline so we can work on Fronti
 
 2. **I/O and halos.** `io_bridge.py` reads the OpenPMD snapshot directly into float32 arrays (`dens`, `temp`, `vel*`) plus an optional 1‑cell ghost layer so that connected components at tile boundaries see their immediate neighbors. We keep ghost handling simple—only global periodic wrap, no cross‑tile stitching—so each rank can proceed independently.
 
-3. **Labeling.** `local_label.py` runs a Numba‑accelerated 3‑D connected components on the full tile (including halo) using the configured connectivity (6, 18, or 26 neighbors). Connectivity is the main science lever: tighter (6) keeps clumps compact, wider (26) fuses tenuous bridges.
+3. **Labeling.** `local_label.py` runs a Numba‑accelerated 3‑D connected components on the full tile (including halo). For production and stitched runs, connectivity is fixed to 6‑connected (face neighbors); 18/26‑connected options are disabled to avoid incorrect cross‑tile merges.
 
 4. **Filtering.** We drop labels smaller than `min_clump_cells` (default 4³). This avoids filling the catalog with noise while keeping the main statistics stable.
 
@@ -71,6 +71,14 @@ Per‑node `.npz` contains:
 Master `.npz` (`clumps_master.npz`) contains concatenated arrays plus `gid` and `rank`.
 Sidecar (optional): JSON with part list and clump count.
 
+### Stitching (global clumps)
+
+- `stitch.py` builds global clumps by unifying per‑rank labels that touch across node faces using a DSU.
+- Stitching is defined for and guarantees correctness under 6‑connectivity only.
+- Usage:
+  - `python stitch.py --input ./clump_out --output ./clump_out/clumps_stitched.npz`
+  - Requires per‑rank `.npz` files to include boundary face maps (auto‑exported by `clump_finder.py`).
+
 ## Frontier (ORNL) Notes
 
 - Use one rank per node:
@@ -90,7 +98,7 @@ sbatch slurm/frontier_clump.sbatch
 - Nres (cubic grid), origin (default [0,0,0])
 - periodic: [true,true,true]
 - temperature_threshold (code units)
-- connectivity: 6|18|26 (default: 6)
+- connectivity: 6 (strict; 18/26 disabled)
 - tile_shape: [128,128,128]
 - ghost_width: 1 (include ghost zones from neighbors; wrap at global domain edges only)
 - field_dtype: float32, accum_dtype: float64

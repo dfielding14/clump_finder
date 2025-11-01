@@ -99,13 +99,28 @@ def main():
         print(f"rank={rank} coords={coords} bbox={node_bbox}")
         return
 
+    # Ensure overlap width and ghost zones are available
+    ghost_cfg_raw = cfg.get("ghost_width", 1)
+    try:
+        ghost_cfg = int(ghost_cfg_raw)
+    except Exception:
+        ghost_cfg = 1
+    overlap_cfg_raw = cfg.get("overlap_width", None)
+    if overlap_cfg_raw is None:
+        overlap_width = max(1, ghost_cfg)
+    else:
+        overlap_width = int(overlap_cfg_raw)
+    if overlap_width < 1:
+        raise ValueError("overlap_width must be >= 1 for overlap-exact stitching")
+    ghost_width = max(ghost_cfg, overlap_width)
+
     # I/O config
     io_cfg = IOConfig(
         dataset_path=str(cfg["dataset_path"]),
         step=int(cfg.get("step", 0)),
         gamma=float(cfg.get("gamma", 5.0 / 3.0)),
         field_dtype=np.dtype(cfg.get("field_dtype", "float32")),
-        ghost_width=int(cfg.get("ghost_width", 1)),
+        ghost_width=ghost_width,
         level_suffix=None,
     )
 
@@ -118,6 +133,8 @@ def main():
     vely = fields["vely"]
     velz = fields["velz"]
     halo = int(max(0, io_cfg.ghost_width))
+    if halo < 1:
+        raise ValueError("ghost_width must be >= 1 to support overlap-exact stitching")
     s = slice(halo, -halo if halo > 0 else None)
     dens_i = dens[s, s, s]
     temp_i = temp[s, s, s]
@@ -126,14 +143,37 @@ def main():
     velz_i = velz[s, s, s]
     t_load = time.time()
 
-    # Threshold mask
-    Tthr = float(cfg.get("temperature_threshold", 1.0))
-    mask = temp < Tthr  # include halo in mask for completeness
+    # Threshold mask with configurable field and comparator
+    cut_by = str(cfg.get("cut_by", "temperature")).lower()
+    cut_op = str(cfg.get("cut_op", "lt")).lower()
+    if cut_by not in ("temperature", "density"):
+        raise ValueError("cut_by must be 'temperature' or 'density'")
+    if cut_op not in ("lt", "gt"):
+        raise ValueError("cut_op must be 'lt' or 'gt'")
+
+    if cut_by == "temperature":
+        thr = float(cfg.get("temperature_threshold", 1.0))
+        field = temp
+    else:
+        thr = float(cfg.get("density_threshold", 1.0))
+        field = dens
+    mask = (field < thr) if cut_op == "lt" else (field > thr)  # include halo in mask for completeness
 
     # Labeling
     tile_shape = tuple(cfg.get("tile_shape", [128, 128, 128]))
     connectivity = int(cfg.get("connectivity", 6))
-    labels = label_3d(mask, tile_shape=tile_shape, connectivity=connectivity, halo=halo)
+    labels_ext = label_3d(mask, tile_shape=tile_shape, connectivity=connectivity, halo=0)
+    if halo > 0:
+        labels_core = labels_ext[halo:-halo, halo:-halo, halo:-halo]
+    else:
+        labels_core = labels_ext
+    core_vals = np.unique(labels_core)
+    core_vals = core_vals[core_vals != 0]
+    lut = np.zeros(int(labels_ext.max()) + 1, dtype=np.uint32)
+    lut[core_vals] = np.arange(1, core_vals.size + 1, dtype=np.uint32)
+    labels_core = lut[labels_core]
+    labels_ext = lut[labels_ext]
+    labels = labels_core
     t_label = time.time()
 
     K = int(labels.max())
@@ -284,31 +324,32 @@ def main():
     # Bounding boxes (global indices, [min,max))
     bbox_ijk = M.compute_bboxes(labels, node_bbox, K=K)
 
-    # Filter out clumps smaller than the configured minimum cell count
-    min_cells = int(cfg.get("min_clump_cells", 64))
-    K_orig = cell_count.shape[0]
-    if K_orig:
-        keep = cell_count >= min_cells
-        dropped = int((~keep).sum())
-        if dropped > 0:
-            print(f"rank={rank} dropping {dropped} clumps smaller than {min_cells} cells")
-    else:
-        keep = np.zeros(0, dtype=bool)
+    ni_c, nj_c, nk_c = labels.shape
+    if overlap_width != 1:
+        raise NotImplementedError("overlap_width > 1 not yet supported")
+    if overlap_width > halo:
+        raise ValueError("overlap_width cannot exceed ghost_width")
+    i_start = halo
+    i_end = halo + ni_c
+    j_start = halo
+    j_end = halo + nj_c
+    k_start = halo
+    k_end = halo + nk_c
+    ovlp_xneg = labels_ext[i_start, j_start:j_end, k_start:k_end].astype(np.uint32, copy=False)
+    ovlp_xpos = labels_ext[i_end - 1, j_start:j_end, k_start:k_end].astype(np.uint32, copy=False)
+    ovlp_yneg = labels_ext[i_start:i_end, j_start, k_start:k_end].astype(np.uint32, copy=False)
+    ovlp_ypos = labels_ext[i_start:i_end, j_end - 1, k_start:k_end].astype(np.uint32, copy=False)
+    ovlp_zneg = labels_ext[i_start:i_end, j_start:j_end, k_start].astype(np.uint32, copy=False)
+    ovlp_zpos = labels_ext[i_start:i_end, j_start:j_end, k_end - 1].astype(np.uint32, copy=False)
 
-    cell_count = cell_count[keep]
-    vol = vol[keep]
-    mass = mass[keep]
-    area = area[keep]
-    cvol = cvol[keep]
-    cmass = cmass[keep]
-    principal_axes_lengths = principal_axes_lengths[keep]
-    axis_ratios = axis_ratios[keep]
-    orientation = orientation[keep]
-    bbox_ijk = bbox_ijk[keep]
-    stats = {
-        k: (v[keep] if isinstance(v, np.ndarray) and v.shape[:1] == (K_orig,) else v)
-        for k, v in stats.items()
-    }
+    # Defer min-clump filtering to global post-stitch stage
+    min_cells_cfg = cfg.get("min_clump_cells", 1)
+    try:
+        min_cells = int(min_cells_cfg) if min_cells_cfg is not None else 1
+    except Exception:
+        min_cells = 1
+    if min_cells > 1 and rank == 0:
+        print(f"NOTE: deferring min_clump_cells={min_cells} filtering until after stitching.")
 
     K = int(cell_count.shape[0])
 
@@ -317,7 +358,36 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(cfg.get("log_dir", "./logs"), exist_ok=True)
 
-    rank_ids = np.arange(1, K_orig + 1, dtype=np.int32)[keep]
+    rank_ids = np.arange(1, K + 1, dtype=np.int32)
+    # For stitching: export boundary face maps from the UNFILTERED labels to preserve thin bridges
+    face_xneg = labels[0, :, :].astype(np.uint32, copy=False)
+    face_xpos = labels[-1, :, :].astype(np.uint32, copy=False)
+    face_yneg = labels[:, 0, :].astype(np.uint32, copy=False)
+    face_ypos = labels[:, -1, :].astype(np.uint32, copy=False)
+    face_zneg = labels[:, :, 0].astype(np.uint32, copy=False)
+    face_zpos = labels[:, :, -1].astype(np.uint32, copy=False)
+
+    # Optional per-label face presence [K, 6] and 15-bit face-pair mask [K]
+    if K:
+        presence = np.zeros((K, 6), dtype=bool)
+        # indices are 1-based labels; map into 0-based rows safely
+        for idx, arr in enumerate((face_xneg, face_xpos, face_yneg, face_ypos, face_zneg, face_zpos)):
+            u = np.unique(arr)
+            u = u[(u > 0) & (u <= K)]
+            presence[u - 1, idx] = True
+        pair_bits = np.zeros((K,), dtype=np.uint16)
+        pairs = [(0,1),(0,2),(0,3),(0,4),(0,5),
+                 (1,2),(1,3),(1,4),(1,5),
+                 (2,3),(2,4),(2,5),
+                 (3,4),(3,5),
+                 (4,5)]
+        for bit, (a, b) in enumerate(pairs):
+            both = presence[:, a] & presence[:, b]
+            pair_bits |= (both.astype(np.uint16) << np.uint16(bit))
+    else:
+        presence = np.zeros((0, 6), dtype=bool)
+        pair_bits = np.zeros((0,), dtype=np.uint16)
+
     out = {
         "label_ids": rank_ids,
         "cell_count": cell_count,
@@ -331,13 +401,43 @@ def main():
         "voxel_spacing": np.array([dx, dy, dz], dtype=np.float64),
         "origin": np.array(origin, dtype=np.float64),
         "connectivity": np.int32(connectivity),
-        "temperature_threshold": np.float64(Tthr),
+        # Threshold provenance
+        "cut_by": np.array(cut_by),
+        "cut_op": np.array(cut_op),
+        "threshold": np.float64(thr),
+        # legacy field for backward compatibility
+        "temperature_threshold": np.float64(thr if cut_by == "temperature" else cfg.get("temperature_threshold", np.nan)),
         "rank": np.int32(rank),
         "node_bbox_ijk": np.array([i0, i1, j0, j1, k0, k1], dtype=np.int64),
         "periodic": np.array([True, True, True], dtype=bool),
+        "overlap_width": np.int32(overlap_width),
+        "ovlp_xneg": ovlp_xneg,
+        "ovlp_xpos": ovlp_xpos,
+        "ovlp_yneg": ovlp_yneg,
+        "ovlp_ypos": ovlp_ypos,
+        "ovlp_zneg": ovlp_zneg,
+        "ovlp_zpos": ovlp_zpos,
         "principal_axes_lengths": principal_axes_lengths,
         "axis_ratios": axis_ratios,
         "orientation": orientation,
+        # Stitching faces
+        "face_xneg": face_xneg,
+        "face_xpos": face_xpos,
+        "face_yneg": face_yneg,
+        "face_ypos": face_ypos,
+        "face_zneg": face_zneg,
+        "face_zpos": face_zpos,
+        # Diagnostics: per-label face presence; Stitch assists: per-label face-pair bits
+        "face_presence": presence,
+        "face_pair_bits": pair_bits,
+        # Exact shell mode (t=3) boundary shells from UNFILTERED labels
+        "shell_t": np.int32(3),
+        "shell_xneg": labels[0:3, :, :].astype(np.uint32, copy=False),
+        "shell_xpos": labels[-3:, :, :].astype(np.uint32, copy=False),
+        "shell_yneg": labels[:, 0:3, :].astype(np.uint32, copy=False),
+        "shell_ypos": labels[:, -3:, :].astype(np.uint32, copy=False),
+        "shell_zneg": labels[:, :, 0:3].astype(np.uint32, copy=False),
+        "shell_zpos": labels[:, :, -3:].astype(np.uint32, copy=False),
     }
     out.update(stats)
 
@@ -377,7 +477,15 @@ def main():
         "labeling": {
             "tile_shape": list(tile_shape),
             "connectivity": int(connectivity),
-            "temperature_threshold": float(Tthr),
+            "cut_by": cut_by,
+            "cut_op": cut_op,
+            "threshold": float(thr),
+            "temperature_threshold": float(thr if cut_by == "temperature" else cfg.get("temperature_threshold", float('nan'))),
+            "ghost_width": int(ghost_width),
+        },
+        "stitching": {
+            "overlap_width": int(overlap_width),
+            "min_clump_cells_deferred": int(min_cells),
         },
         "git_rev": _git_rev(),
         "config": cfg,
