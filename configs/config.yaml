@@ -8,7 +8,7 @@ log_dir: ./logs
 
 # Selection (code units)
 temperature_threshold: 0.1
-connectivity: 6                        # 6 | 18 | 26
+connectivity: 6                        # 6 only (18/26 disabled)
 min_clump_cells: 27                    # ignore clumps smaller than this cell count
 
 # Geometry (cubic grid)

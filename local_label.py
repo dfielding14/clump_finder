@@ -141,7 +141,13 @@ def label_3d(mask: np.ndarray,
     Returns labels (uint32) of shape interior-only if halo>0; same shape as mask otherwise.
     Labels are compacted to 1..K within the node-local subvolume (no global stitching).
     """
-    assert connectivity in (6, 18, 26)
+    # Production stitching and cross-tile merges are correct only for 6-connectivity
+    # (face adjacency). 18/26 would require additional cross-tile edge/corner merges.
+    if connectivity != 6:
+        raise NotImplementedError(
+            "Stitched runs support connectivity=6 only. 18/26 require additional "
+            "cross-tile edge/corner merges."
+        )
     neigh = _neighbor_offsets(connectivity)
 
     if halo > 0:
@@ -168,7 +174,13 @@ def label_3d(mask: np.ndarray,
                 # compact local labels to 1..Kt
                 Kt = _compact_labels_inplace(tlabels)
                 if Kt > 0:
-                    labels[i0:i1, j0:j1, k0:k1] = tlabels + gbase
+                    tlabels = tlabels.astype(np.uint32, copy=False)
+                    if gbase != 0:
+                        mask_pos = tlabels > 0
+                        if mask_pos.any():
+                            tlabels = tlabels.copy()
+                            tlabels[mask_pos] += np.uint32(gbase)
+                    labels[i0:i1, j0:j1, k0:k1] = tlabels
                     tile_labels_bases.append((i0, i1, j0, j1, k0, k1, gbase))
                     gbase += Kt
                 else:
@@ -236,4 +248,3 @@ def label_3d(mask: np.ndarray,
         _compact_labels_inplace(labels)
 
     return labels
-
