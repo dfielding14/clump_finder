@@ -10,9 +10,6 @@ import numpy as np
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-import matplotlib
-matplotlib.use("Agg")  # headless plotting
-import matplotlib.pyplot as plt
 from local_label import label_3d
 import metrics as M
 from stitch import stitch_reduce, index_parts, build_edges
@@ -189,9 +186,6 @@ def _baseline_single_volume(dens, temp, dx=1.0, dy=1.0, dz=1.0, thr=0.1, by="tem
         area = M.exposed_area(labels, dx, dy, dz, K=K)
     out = {
         "K": K,
-        "cell_counts": cell.copy(),
-        "volumes": vol.copy(),
-        "areas": area.copy(),
         "cell_sorted": np.sort(cell),
         "area_sum": float(area.sum()),
         "vol_sum": float(vol.sum()),
@@ -358,24 +352,13 @@ def _write_parts(tmpdir: str,
                 rank += 1
 
 
-def _compare(baseline: dict, stitched_npz: str) -> tuple[bool, dict]:
+def _compare(baseline: dict, stitched_npz: str) -> bool:
     with np.load(stitched_npz) as d:
-        cc = d["cell_count"].copy()
-        area = d["area"].copy()
-        volume = d["volume"].copy()
-        mass = d["mass"].copy()
-        bbox = d["bbox_ijk"].copy()
-    diag = {
-        "baseline": baseline,
-        "stitched": {
-            "cell_count": cc,
-            "area": area,
-            "volume": volume,
-            "mass": mass,
-            "bbox": bbox,
-        },
-        "npz_path": stitched_npz,
-    }
+        cc = d["cell_count"]
+        area = d["area"]
+        volume = d["volume"]
+        mass = d["mass"]
+        bbox = d["bbox_ijk"]
     try:
         assert cc.size == baseline["K"], f"K mismatch: {cc.size} vs {baseline['K']}"
         assert np.allclose(np.sort(cc), baseline["cell_sorted"]) , "cell_count mismatch"
@@ -384,32 +367,10 @@ def _compare(baseline: dict, stitched_npz: str) -> tuple[bool, dict]:
         assert np.isclose(mass.sum(), baseline["mass_sum"]) , "mass sum mismatch"
         # bbox union check: sort rows and compare per-column sorted extrema
         assert np.allclose(np.sort(bbox, axis=0), baseline["bbox_sorted"]) , "bbox mismatch"
-        return True, diag
+        return True
     except AssertionError as e:
         print(f"Equivalence check FAILED: {e}")
-        diag["error"] = str(e)
-        return False, diag
-
-
-def _plot_temp_slice(temp: np.ndarray, axis: str = "k", index: int | None = None, outpath: str | None = None):
-    N = temp.shape[0]
-    if index is None:
-        index = N // 2
-    if axis == "i":
-        img = temp[index, :, :]
-    elif axis == "j":
-        img = temp[:, index, :]
-    else:
-        img = temp[:, :, index]
-    plt.figure(figsize=(5, 4))
-    vmin, vmax = np.percentile(img, [2, 98])
-    plt.imshow(img.T, origin="lower", cmap="magma", vmin=vmin, vmax=vmax)
-    plt.colorbar(label="Temperature")
-    plt.title(f"Temp slice {axis}={index}")
-    plt.tight_layout()
-    if outpath:
-        plt.savefig(outpath, dpi=150)
-    plt.close()
+        return False
 
 
 def _diagnose_interfaces(parts_dir: str, dens: np.ndarray, temp: np.ndarray,
@@ -782,243 +743,49 @@ def _subgraph_component_connectivity(parts_dir: str, base_labels: np.ndarray, b_
 
 
 
-def _plot_mass_function_both(mT_base: np.ndarray | None, mT_st: np.ndarray | None,
-                             mR_base: np.ndarray | None, mR_st: np.ndarray | None,
-                             outpath: str, bins: int = 40):
-    # Prepare arrays (filter positives)
-    arrays = []
-    labels = []
-    colors = []
-    if mT_base is not None:
-        mb = mT_base[mT_base > 0]
-        arrays.append(("T baseline", mb))
-        labels.append("T baseline")
-        colors.append("tab:blue")
-    if mT_st is not None:
-        ms = mT_st[mT_st > 0]
-        arrays.append(("T stitched", ms))
-        labels.append("T stitched")
-        colors.append("tab:orange")
-    if mR_base is not None:
-        mbR = mR_base[mR_base > 0]
-        arrays.append(("rho baseline", mbR))
-        labels.append("rho baseline")
-        colors.append("tab:green")
-    if mR_st is not None:
-        msR = mR_st[mR_st > 0]
-        arrays.append(("rho stitched", msR))
-        labels.append("rho stitched")
-        colors.append("tab:red")
-
-    plt.figure(figsize=(5.6, 4.2))
-    if len(arrays) == 0 or all(arr.size == 0 for _, arr in arrays):
-        plt.text(0.5, 0.5, "No clumps to plot", ha="center", va="center")
-        plt.axis("off")
-    else:
-        # Determine common log10 bin edges spanning all sets that are non-empty
-        mins = [arr.min() for _, arr in arrays if arr.size > 0]
-        maxs = [arr.max() for _, arr in arrays if arr.size > 0]
-        lo, hi = min(mins), max(maxs)
-        xlo, xhi = np.log10(lo), np.log10(hi + 1e-300)
-        edges = np.linspace(xlo, xhi, bins + 1)
-        centers = 0.5 * (edges[1:] + edges[:-1])
-        width_dex = edges[1:] - edges[:-1]
-        for (name, arr), color in zip(arrays, colors):
-            if arr.size == 0:
-                continue
-            H, _ = np.histogram(np.log10(arr), bins=edges)
-            H = H / width_dex
-            plt.plot(10**centers, H, drawstyle="steps-mid", label=name, color=color)
-        plt.xscale("log")
-        plt.yscale("log")
-        plt.xlabel("Mass")
-        plt.ylabel("dN / dlog10 M")
-        plt.legend(frameon=False, ncol=2)
-        plt.tight_layout()
-    plt.savefig(outpath, dpi=150)
-    plt.close()
-
-
-def _plot_volume_hist(base_vol: np.ndarray, stitched_vol: np.ndarray, outpath: str, bins: int = 60):
-    plt.figure(figsize=(6.0, 4.2))
-    b = base_vol[base_vol > 0]
-    s = stitched_vol[stitched_vol > 0]
-    if b.size == 0 and s.size == 0:
-        plt.text(0.5, 0.5, "No positive-volume clumps", ha="center", va="center")
-        plt.axis("off")
-    else:
-        data = []
-        labels = []
-        if b.size:
-            data.append(np.log10(b))
-            labels.append(("Baseline", "tab:blue"))
-        if s.size:
-            data.append(np.log10(s))
-            labels.append(("Stitched", "tab:orange"))
-        lo = min(arr.min() for arr in data)
-        hi = max(arr.max() for arr in data)
-        edges = np.linspace(lo, hi, bins + 1)
-        centers = 0.5 * (edges[1:] + edges[:-1])
-        width = edges[1:] - edges[:-1]
-        for arr, (name, color) in zip(data, labels):
-            H, _ = np.histogram(arr, bins=edges)
-            H = H / (width + 1e-12)
-            plt.plot(10 ** centers, H, drawstyle="steps-mid", label=name, color=color)
-        plt.xscale("log")
-        plt.yscale("log")
-        plt.xlabel("Volume")
-        plt.ylabel("dN / dlog10(V)")
-        plt.legend(frameon=False)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=150)
-    plt.close()
-
-
-def _plot_area_ratio_hist(base_area: np.ndarray, base_vol: np.ndarray,
-                          st_area: np.ndarray, st_vol: np.ndarray,
-                          outpath: str, bins: int = 60) -> tuple[float, float]:
-    def _ratio(area, vol):
-        vol = np.asarray(vol, dtype=np.float64)
-        area = np.asarray(area, dtype=np.float64)
-        mask = (vol > 0) & (area > 0)
-        if not np.any(mask):
-            return np.zeros((0,), dtype=np.float64)
-        return area[mask] / np.power(vol[mask], 2.0 / 3.0)
-
-    ratio_base = _ratio(base_area, base_vol)
-    ratio_st = _ratio(st_area, st_vol)
-
-    plt.figure(figsize=(6.0, 4.0))
-    if ratio_base.size == 0 and ratio_st.size == 0:
-        plt.text(0.5, 0.5, "No positive ratio samples", ha="center", va="center")
-        plt.axis("off")
-    else:
-        data = []
-        labels = []
-        if ratio_base.size:
-            data.append(ratio_base)
-            labels.append(("Baseline", "tab:green"))
-        if ratio_st.size:
-            data.append(ratio_st)
-            labels.append(("Stitched", "tab:red"))
-        lo = min(arr.min() for arr in data)
-        hi = max(arr.max() for arr in data)
-        edges = np.linspace(lo, hi, bins + 1)
-        for arr, (name, color) in zip(data, labels):
-            plt.hist(arr, bins=edges, alpha=0.5, label=name, color=color, density=True)
-        plt.axvline(6.0, color="black", linestyle="--", linewidth=1.0, label="Min expected (6)")
-        plt.xlabel("Area / Volume^{2/3}")
-        plt.ylabel("PDF")
-        plt.legend(frameon=False)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=150)
-    plt.close()
-    base_min = float(ratio_base.min()) if ratio_base.size else float("nan")
-    st_min = float(ratio_st.min()) if ratio_st.size else float("nan")
-    return base_min, st_min
-
-
-def _diagnose_failure(diag: dict, label: str, outdir: str):
-    stitched = diag["stitched"]
-    baseline = diag["baseline"]
-    npz_path = diag.get("npz_path")
-    if npz_path:
-        print(f"[DIAG][{label}] NPZ: {npz_path}")
-
-    base_cells = np.sort(baseline["cell_counts"])
-    st_cells = np.sort(stitched["cell_count"])
-    print(f"[DIAG][{label}] baseline K={base_cells.size}, stitched K={st_cells.size}")
-    print(f"[DIAG][{label}] total cells baseline={base_cells.sum()} stitched={st_cells.sum()}")
-    if base_cells.size and st_cells.size:
-        min_len = min(base_cells.size, st_cells.size)
-        diff = st_cells[:min_len] - base_cells[:min_len]
-        print(f"[DIAG][{label}] cell_count diff stats -> min={diff.min():.0f}, max={diff.max():.0f}, mean={diff.mean():.2f}")
-        print(f"[DIAG][{label}] largest baseline counts: {base_cells[-5:]}")
-        print(f"[DIAG][{label}] largest stitched counts: {st_cells[-5:]}")
-
-    vol_path = os.path.join(outdir, f"diag_volume_{label}.png")
-    _plot_volume_hist(baseline["volumes"], stitched["volume"], vol_path)
-    print(f"[DIAG][{label}] volume histogram saved to {vol_path}")
-
-    ratio_path = os.path.join(outdir, f"diag_area_ratio_{label}.png")
-    base_min, st_min = _plot_area_ratio_hist(
-        baseline["areas"], baseline["volumes"],
-        stitched["area"], stitched["volume"],
-        ratio_path,
-    )
-    print(f"[DIAG][{label}] area/volume^(2/3) min baseline={base_min:.3f} stitched={st_min:.3f}")
-    if np.isfinite(st_min) and st_min < 6.0:
-        print(f"[DIAG][{label}] WARNING: stitched area/volume^(2/3) dipped below 6.0")
-    print(f"[DIAG][{label}] area-ratio histogram saved to {ratio_path}")
-
-
 def run_equivalence(N=96, px=2, py=2, pz=1,
                     T_thr: float = 0.1, R_thr: float = 10.0,
                     field_type: str = "simple", beta: float = -2.0,
-                    plot: bool = False, plot_out: str | None = None, plot_axis: str = "k", plot_index: int | None = None,
-                    mass_plot_out: str | None = None,
-                    debug_interfaces: bool = False,
-                    use_halo: bool = True,
-                    overlap: int = 1,
-                    stitch_mode: str = "overlap-exact"):
+                    debug_interfaces: bool = False):
     dens, temp = _make_fields(N, field_type=field_type, beta=beta,
                               T_limits=(0.01, 1.0), R_limits=(1.0, 100.0))
-    if plot:
-        out = plot_out or f"temp_slice_{field_type}.png"
-        _plot_temp_slice(temp, axis=plot_axis, index=plot_index, outpath=out)
-    base_T = _baseline_single_volume(dens, temp, thr=T_thr, by="temperature", return_masses=plot)
-    base_R = _baseline_single_volume(dens, temp, thr=R_thr, by="density", return_masses=plot)
+    base_T = _baseline_single_volume(dens, temp, thr=T_thr, by="temperature", return_masses=False)
+    base_R = _baseline_single_volume(dens, temp, thr=R_thr, by="density", return_masses=False)
 
     tmpdir = tempfile.mkdtemp(prefix="tiles_")
     try:
         _write_parts(tmpdir, dens, temp, px, py, pz,
-                     thr=T_thr, by="temperature", use_halo=use_halo, overlap=overlap)
+                     thr=T_thr, by="temperature", use_halo=True, overlap=1)
         outT = os.path.join(tmpdir, "stitched_T.npz")
-        stitch_reduce(tmpdir, outT, mode=stitch_mode)
-        ok_T, diag_T = _compare(base_T, outT)
-        masses_T_stitched = None
-        if plot:
-            with np.load(outT) as d:
-                masses_T_stitched = d["mass"]
+        stitch_reduce(tmpdir, outT)
+        ok_T = _compare(base_T, outT)
         if debug_interfaces:
             print("[DEBUG] Temperature-cut interface diagnostics:")
             _diagnose_interfaces(tmpdir, dens, temp, px, py, pz, by="temperature", thr=T_thr)
             _diagnose_component_mismatch(tmpdir, dens, temp, px, py, pz, by="temperature", thr=T_thr)
             # Face-only baseline comparator for T-cut
-            face_only_K = _face_only_component_count((temp < T_thr), px, py, pz, use_halo=use_halo)
+            face_only_K = _face_only_component_count((temp < T_thr), px, py, pz, use_halo=True)
             with np.load(outT) as d:
                 stitched_K = int(d["cell_count"].shape[0])
             print(f"  [face-only] components={face_only_K} vs stitched_K={stitched_K}")
-        if not ok_T:
-            _diagnose_failure(diag_T, "temperature", tmpdir)
 
         # clean parts and redo for density cut
         for f in os.listdir(tmpdir):
             if f.startswith("clumps_rank"):
                 os.remove(os.path.join(tmpdir, f))
         _write_parts(tmpdir, dens, temp, px, py, pz,
-                     thr=R_thr, by="density", use_halo=use_halo, overlap=overlap)
+                     thr=R_thr, by="density", use_halo=True, overlap=1)
         outR = os.path.join(tmpdir, "stitched_R.npz")
-        stitch_reduce(tmpdir, outR, mode=stitch_mode)
-        ok_R, diag_R = _compare(base_R, outR)
-        masses_R_stitched = None
-        if plot:
-            with np.load(outR) as d:
-                masses_R_stitched = d["mass"]
-            mp = mass_plot_out or f"mass_fn_{field_type}.png"
-            _plot_mass_function_both(base_T.get("masses"), masses_T_stitched,
-                                     base_R.get("masses"), masses_R_stitched,
-                                     mp)
+        stitch_reduce(tmpdir, outR)
+        ok_R = _compare(base_R, outR)
         if debug_interfaces:
             print("[DEBUG] Density-cut interface diagnostics:")
             _diagnose_interfaces(tmpdir, dens, temp, px, py, pz, by="density", thr=R_thr)
             _diagnose_component_mismatch(tmpdir, dens, temp, px, py, pz, by="density", thr=R_thr)
-            face_only_K = _face_only_component_count((dens < R_thr), px, py, pz, use_halo=use_halo)
+            face_only_K = _face_only_component_count((dens < R_thr), px, py, pz, use_halo=True)
             with np.load(outR) as d:
                 stitched_K = int(d["cell_count"].shape[0])
             print(f"  [face-only] components={face_only_K} vs stitched_K={stitched_K}")
-        if not ok_R:
-            _diagnose_failure(diag_R, "density", tmpdir)
         if ok_T and ok_R:
             print("Equivalence test passed (single-volume == tiled+stitched) for T and density cuts.")
         else:
@@ -1039,28 +806,15 @@ if __name__ == "__main__":
     ap.add_argument("--thr", type=float, default=None, help="deprecated: sets both T and rho thresholds")
     ap.add_argument("--field-type", choices=["simple", "powerlaw"], default="simple")
     ap.add_argument("--beta", type=float, default=-2.0, help="power spectrum slope (powerlaw)")
-    ap.add_argument("--plot", action="store_true")
-    ap.add_argument("--plot-out", default=None)
-    ap.add_argument("--plot-axis", choices=["i", "j", "k"], default="k")
-    ap.add_argument("--plot-index", type=int, default=None)
-    ap.add_argument("--mass-plot-out", default=None)
     ap.add_argument("--debug-interfaces", action="store_true")
-    ap.add_argument("--no-halo", action="store_true", help="disable 1-cell halo in per-tile labeling")
-    ap.add_argument("--overlap", type=int, default=1, help="overlap width in cells (must be >=1)")
-    ap.add_argument("--stitch-mode", choices=["face", "shell", "boundary", "exact", "overlap-exact"], default="overlap-exact")
+    ap.add_argument("--overlap", type=int, default=1, help="kept for compatibility; must be 1")
     args = ap.parse_args()
 
     # Backward-compat: --thr overrides if provided
     T_thr = args.T_thr if args.thr is None else args.thr
     R_thr = args.R_thr if args.thr is None else args.thr
-    overlap = int(args.overlap)
-    if overlap < 1:
-        raise ValueError("--overlap must be >= 1 for overlap-exact stitching")
+    if args.overlap != 1:
+        raise ValueError("--overlap must be 1; overlap-exact stitching expects a 1-cell halo")
     run_equivalence(N=args.N, px=args.px, py=args.py, pz=args.pz, T_thr=T_thr, R_thr=R_thr,
                     field_type=args.field_type, beta=args.beta,
-                    plot=args.plot, plot_out=args.plot_out, plot_axis=args.plot_axis, plot_index=args.plot_index,
-                    mass_plot_out=args.mass_plot_out,
-                    debug_interfaces=args.debug_interfaces,
-                    use_halo=(not args.no_halo),
-                    overlap=overlap,
-                    stitch_mode=args.stitch_mode)
+                    debug_interfaces=args.debug_interfaces)
