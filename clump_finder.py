@@ -38,16 +38,12 @@ def parse_config(path: str) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--profile", action="store_true")
-    ap.add_argument("--excess-kurtosis", action="store_true", dest="excess_kurtosis")
-    ap.add_argument("--auto-aggregate-plot", action="store_true",
-                    help="After all ranks finish, aggregate on rank 0 and emit PNG plots")
-    ap.add_argument("--assert-nres-from-data", action="store_true",
-                    help="Override/validate Nres by reading dataset shape; warns if mismatch.")
+    ap.add_argument("--extra-stats", action="store_true",
+                    help="Compute extended per-clump statistics and shape diagnostics.")
     args = ap.parse_args()
 
     cfg = parse_config(args.config)
+    extra_stats = bool(cfg.get("extra_stats", False)) or args.extra_stats
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -62,7 +58,7 @@ def main():
     # Grid resolution and spacing
     N = int(cfg.get("Nres", 0))
     # Optionally assert/override from data (rank 0)
-    if args.assert_nres_from_data or cfg.get("assert_nres_from_data", False):
+    if cfg.get("assert_nres_from_data", False):
         if rank == 0:
             try:
                 (Nz, Ny, Nx), lvl = query_domain_shape(str(cfg["dataset_path"]), int(cfg.get("step", 0)))
@@ -92,12 +88,6 @@ def main():
     j0, j1 = split_axis(N, py, coords[1])
     k0, k1 = split_axis(N, pz, coords[2])
     node_bbox = ((i0, i1), (j0, j1), (k0, k1))
-
-    if args.dry_run:
-        if rank == 0:
-            print(f"World size={size} dims={(px,py,pz)}")
-        print(f"rank={rank} coords={coords} bbox={node_bbox}")
-        return
 
     # Ensure overlap width and ghost zones are available
     ghost_cfg_raw = cfg.get("ghost_width", 1)
@@ -187,143 +177,185 @@ def main():
     cvol, cmass = M.centroids(labels, dens_i, dx, dy, dz, origin, node_bbox, K=K)
     area = M.exposed_area(labels, dx, dy, dz, K=K)
 
-    # Stats for variables (volume-weighted and mass-weighted)
-    # weights: volume -> Vc; mass -> dens*Vc
-    weight_vol = np.full(dens_i.shape, Vc, dtype=np.float64)
-    weight_mass = (dens_i.astype(np.float64, copy=False)) * Vc
-
-    pressure = dens_i * temp_i
-
-    stats = {}
-    for name, arr in (
-        ("rho", dens_i),
-        ("T", temp_i),
-        ("vx", velx_i),
-        ("vy", vely_i),
-        ("vz", velz_i),
-        ("pressure", pressure),
-    ):
-        mu, sd, sk, ku = M.per_label_stats(labels, arr, weights=weight_vol, K=K, excess_kurtosis=args.excess_kurtosis)
-        stats[f"{name}_mean"] = mu
-        stats[f"{name}_std"] = sd
-        stats[f"{name}_skew"] = sk
-        stats[f"{name}_kurt"] = ku
-
-        mu_m, sd_m, sk_m, ku_m = M.per_label_stats(labels, arr, weights=weight_mass, K=K, excess_kurtosis=args.excess_kurtosis)
-        stats[f"{name}_mean_massw"] = mu_m
-        stats[f"{name}_std_massw"] = sd_m
-        stats[f"{name}_skew_massw"] = sk_m
-        stats[f"{name}_kurt_massw"] = ku_m
-
-    # Shape metrics (mass-weighted covariance)
-    # Compute first and second moments using mass weights
-    # Accumulate sums required for covariance: Sx, Sy, Sz, Sxx, Syy, Szz, Sxy, Sxz, Syz, W
-    W = np.zeros(K + 1, dtype=np.float64)
-    Sx = np.zeros(K + 1, dtype=np.float64)
-    Sy = np.zeros(K + 1, dtype=np.float64)
-    Sz = np.zeros(K + 1, dtype=np.float64)
-    Sxx = np.zeros(K + 1, dtype=np.float64)
-    Syy = np.zeros(K + 1, dtype=np.float64)
-    Szz = np.zeros(K + 1, dtype=np.float64)
-    Sxy = np.zeros(K + 1, dtype=np.float64)
-    Sxz = np.zeros(K + 1, dtype=np.float64)
-    Syz = np.zeros(K + 1, dtype=np.float64)
-
-    (i0, i1), (j0, j1), (k0, k1) = node_bbox
-    xi = origin[0] + (np.arange(i0, i1) + 0.5) * dx
-    yj = origin[1] + (np.arange(j0, j1) + 0.5) * dy
-    zk = origin[2] + (np.arange(k0, k1) + 0.5) * dz
-
-    # Accumulate by looping over slices to keep memory steady
-    for i in range(labels.shape[0]):
-        L = labels[i, :, :].ravel()
-        w = (dens_i[i, :, :].ravel().astype(np.float64, copy=False)) * Vc
-        W += np.bincount(L, weights=w, minlength=K + 1)
-        x = xi[i]
-        Sx += x * np.bincount(L, weights=w, minlength=K + 1)
-        Sxx += (x * x) * np.bincount(L, weights=w, minlength=K + 1)
-
-    for j in range(labels.shape[1]):
-        L = labels[:, j, :].ravel()
-        w = (dens_i[:, j, :].ravel().astype(np.float64, copy=False)) * Vc
-        y = yj[j]
-        Sy += y * np.bincount(L, weights=w, minlength=K + 1)
-        Syy += (y * y) * np.bincount(L, weights=w, minlength=K + 1)
-
-    for k in range(labels.shape[2]):
-        L = labels[:, :, k].ravel()
-        w = (dens_i[:, :, k].ravel().astype(np.float64, copy=False)) * Vc
-        z = zk[k]
-        Sz += z * np.bincount(L, weights=w, minlength=K + 1)
-        Szz += (z * z) * np.bincount(L, weights=w, minlength=K + 1)
-
-    # Cross terms Sxy, Sxz, Syz: compute by looping over (i,j) rows and summing over k
-    # This is heavier but still keeps memory bounded per plane.
-    for j in range(labels.shape[1]):
-        y = yj[j]
-        for i in range(labels.shape[0]):
-            L = labels[i, j, :]
-            w = (dens_i[i, j, :].astype(np.float64, copy=False)) * Vc
-            if L.size == 0:
-                continue
-            Sxy += (xi[i] * y) * np.bincount(L, weights=w, minlength=K + 1)
-
-    for k in range(labels.shape[2]):
-        z = zk[k]
-        for i in range(labels.shape[0]):
-            L = labels[i, :, k]
-            w = (dens_i[i, :, k].astype(np.float64, copy=False)) * Vc
-            Sxz += (xi[i] * z) * np.bincount(L, weights=w, minlength=K + 1)
-
-    for k in range(labels.shape[2]):
-        z = zk[k]
-        for j in range(labels.shape[1]):
-            L = labels[:, j, k]
-            w = (dens_i[:, j, k].astype(np.float64, copy=False)) * Vc
-            Syz += (yj[j] * z) * np.bincount(L, weights=w, minlength=K + 1)
-
-    # Drop background
-    W = W[1:]
-    Sx, Sy, Sz = Sx[1:], Sy[1:], Sz[1:]
-    Sxx, Syy, Szz = Sxx[1:], Syy[1:], Szz[1:]
-    Sxy, Sxz, Syz = Sxy[1:], Sxz[1:], Syz[1:]
-
-    # Means and covariances
-    mu_x = Sx / (W + 1e-300)
-    mu_y = Sy / (W + 1e-300)
-    mu_z = Sz / (W + 1e-300)
-    Cxx = Sxx / (W + 1e-300) - mu_x * mu_x
-    Cyy = Syy / (W + 1e-300) - mu_y * mu_y
-    Czz = Szz / (W + 1e-300) - mu_z * mu_z
-    Cxy = Sxy / (W + 1e-300) - mu_x * mu_y
-    Cxz = Sxz / (W + 1e-300) - mu_x * mu_z
-    Cyz = Syz / (W + 1e-300) - mu_y * mu_z
-
-    principal_axes_lengths = np.zeros((K, 3), dtype=np.float64)
-    axis_ratios = np.zeros((K, 2), dtype=np.float64)
-    orientation = np.zeros((K, 3, 3), dtype=np.float64)
-    for idx in range(K):
-        C = np.array([[Cxx[idx], Cxy[idx], Cxz[idx]],
-                      [Cxy[idx], Cyy[idx], Cyz[idx]],
-                      [Cxz[idx], Cyz[idx], Czz[idx]]], dtype=np.float64)
-        # ensure symmetry and numerical stability
-        C = (C + C.T) * 0.5
-        vals, vecs = np.linalg.eigh(C)
-        # sort descending
-        order = np.argsort(vals)[::-1]
-        vals = vals[order]
-        vecs = vecs[:, order]
-        # RMS extents
-        a = np.sqrt(max(vals[0], 0.0))
-        b = np.sqrt(max(vals[1], 0.0))
-        c = np.sqrt(max(vals[2], 0.0))
-        principal_axes_lengths[idx, :] = (a, b, c)
-        axis_ratios[idx, :] = (b / (a + 1e-300), c / (a + 1e-300))
-        orientation[idx, :, :] = vecs
+    # Always provide velocity magnitude mean/std for stitched diagnostics
+    speed = np.sqrt(
+        velx_i.astype(np.float64, copy=False) ** 2
+        + vely_i.astype(np.float64, copy=False) ** 2
+        + velz_i.astype(np.float64, copy=False) ** 2
+    )
+    v_mean, v_std, _, _ = M.per_label_stats(labels, speed, K=K, excess_kurtosis=False)
 
     # Bounding boxes (global indices, [min,max))
     bbox_ijk = M.compute_bboxes(labels, node_bbox, K=K)
 
+    extra_out: dict[str, np.ndarray] = {}
+    if extra_stats:
+        kurtosis_excess = bool(cfg.get("excess_kurtosis", False))
+        Vc64 = float(Vc)
+        weight_vol = np.full(labels.shape, Vc64, dtype=np.float64)
+        weight_mass = dens_i.astype(np.float64, copy=False) * Vc64
+        pressure = dens_i * temp_i
+
+        stats = {}
+        for name, arr in (
+            ("rho", dens_i),
+            ("T", temp_i),
+            ("vx", velx_i),
+            ("vy", vely_i),
+            ("vz", velz_i),
+            ("pressure", pressure),
+        ):
+            mu, sd, sk, ku = M.per_label_stats(labels, arr, weights=weight_vol, K=K, excess_kurtosis=kurtosis_excess)
+            stats[f"{name}_mean"] = mu
+            stats[f"{name}_std"] = sd
+            stats[f"{name}_skew"] = sk
+            stats[f"{name}_kurt"] = ku
+
+            mu_m, sd_m, sk_m, ku_m = M.per_label_stats(labels, arr, weights=weight_mass, K=K, excess_kurtosis=kurtosis_excess)
+            stats[f"{name}_mean_massw"] = mu_m
+            stats[f"{name}_std_massw"] = sd_m
+            stats[f"{name}_skew_massw"] = sk_m
+            stats[f"{name}_kurt_massw"] = ku_m
+
+        # Shape diagnostics via mass-weighted covariance tensor
+        (i0, i1), (j0, j1), (k0, k1) = node_bbox
+        xi = origin[0] + (np.arange(i0, i1) + 0.5) * dx
+        yj = origin[1] + (np.arange(j0, j1) + 0.5) * dy
+        zk = origin[2] + (np.arange(k0, k1) + 0.5) * dz
+
+        W = np.zeros(K + 1, dtype=np.float64)
+        Sx = np.zeros(K + 1, dtype=np.float64)
+        Sy = np.zeros(K + 1, dtype=np.float64)
+        Sz = np.zeros(K + 1, dtype=np.float64)
+        Sxx = np.zeros(K + 1, dtype=np.float64)
+        Syy = np.zeros(K + 1, dtype=np.float64)
+        Szz = np.zeros(K + 1, dtype=np.float64)
+        Sxy = np.zeros(K + 1, dtype=np.float64)
+        Sxz = np.zeros(K + 1, dtype=np.float64)
+        Syz = np.zeros(K + 1, dtype=np.float64)
+
+        for i in range(labels.shape[0]):
+            L = labels[i, :, :].ravel()
+            if L.size == 0:
+                continue
+            w = (dens_i[i, :, :].ravel().astype(np.float64, copy=False)) * Vc64
+            binc = np.bincount(L, weights=w, minlength=K + 1)
+            W += binc
+            x = xi[i]
+            Sx += x * binc
+            Sxx += (x * x) * binc
+
+        for j in range(labels.shape[1]):
+            L = labels[:, j, :].ravel()
+            w = (dens_i[:, j, :].ravel().astype(np.float64, copy=False)) * Vc64
+            binc = np.bincount(L, weights=w, minlength=K + 1)
+            y = yj[j]
+            Sy += y * binc
+            Syy += (y * y) * binc
+
+        for k in range(labels.shape[2]):
+            L = labels[:, :, k].ravel()
+            w = (dens_i[:, :, k].ravel().astype(np.float64, copy=False)) * Vc64
+            binc = np.bincount(L, weights=w, minlength=K + 1)
+            z = zk[k]
+            Sz += z * binc
+            Szz += (z * z) * binc
+
+        for j in range(labels.shape[1]):
+            y = yj[j]
+            for i in range(labels.shape[0]):
+                L = labels[i, j, :]
+                if L.size == 0:
+                    continue
+                w = (dens_i[i, j, :].astype(np.float64, copy=False)) * Vc64
+                Sxy += (xi[i] * y) * np.bincount(L, weights=w, minlength=K + 1)
+
+        for k in range(labels.shape[2]):
+            z = zk[k]
+            for i in range(labels.shape[0]):
+                L = labels[i, :, k]
+                w = (dens_i[i, :, k].astype(np.float64, copy=False)) * Vc64
+                Sxz += (xi[i] * z) * np.bincount(L, weights=w, minlength=K + 1)
+
+        for k in range(labels.shape[2]):
+            z = zk[k]
+            for j in range(labels.shape[1]):
+                L = labels[:, j, k]
+                w = (dens_i[:, j, k].astype(np.float64, copy=False)) * Vc64
+                Syz += (yj[j] * z) * np.bincount(L, weights=w, minlength=K + 1)
+
+        W = W[1:]
+        Sx = Sx[1:]; Sy = Sy[1:]; Sz = Sz[1:]
+        Sxx = Sxx[1:]; Syy = Syy[1:]; Szz = Szz[1:]
+        Sxy = Sxy[1:]; Sxz = Sxz[1:]; Syz = Syz[1:]
+
+        small = 1e-300
+        mu_x = Sx / (W + small)
+        mu_y = Sy / (W + small)
+        mu_z = Sz / (W + small)
+
+        Cxx = Sxx / (W + small) - mu_x * mu_x
+        Cyy = Syy / (W + small) - mu_y * mu_y
+        Czz = Szz / (W + small) - mu_z * mu_z
+        Cxy = Sxy / (W + small) - mu_x * mu_y
+        Cxz = Sxz / (W + small) - mu_x * mu_z
+        Cyz = Syz / (W + small) - mu_y * mu_z
+
+        principal_axes_lengths = np.zeros((K, 3), dtype=np.float64)
+        axis_ratios = np.zeros((K, 2), dtype=np.float64)
+        orientation = np.zeros((K, 3, 3), dtype=np.float64)
+        for idx in range(K):
+            C = np.array([[Cxx[idx], Cxy[idx], Cxz[idx]],
+                          [Cxy[idx], Cyy[idx], Cyz[idx]],
+                          [Cxz[idx], Cyz[idx], Czz[idx]]], dtype=np.float64)
+            C = (C + C.T) * 0.5
+            vals, vecs = np.linalg.eigh(C)
+            order = np.argsort(vals)[::-1]
+            vals = vals[order]
+            vecs = vecs[:, order]
+            a = np.sqrt(max(vals[0], 0.0))
+            b = np.sqrt(max(vals[1], 0.0))
+            c = np.sqrt(max(vals[2], 0.0))
+            principal_axes_lengths[idx, :] = (a, b, c)
+            axis_ratios[idx, :] = (b / (a + small), c / (a + small))
+            orientation[idx, :, :] = vecs
+
+        presence = np.zeros((K, 6), dtype=bool)
+        for idx, arr in enumerate((labels[0, :, :],
+                                   labels[-1, :, :],
+                                   labels[:, 0, :],
+                                   labels[:, -1, :],
+                                   labels[:, :, 0],
+                                   labels[:, :, -1])):
+            u = np.unique(arr)
+            u = u[(u > 0) & (u <= K)]
+            presence[u - 1, idx] = True
+
+        pair_bits = np.zeros((K,), dtype=np.uint16)
+        pairs = [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
+                 (1, 2), (1, 3), (1, 4), (1, 5),
+                 (2, 3), (2, 4), (2, 5),
+                 (3, 4), (3, 5),
+                 (4, 5)]
+        for bit, (a, b) in enumerate(pairs):
+            both = presence[:, a] & presence[:, b]
+            pair_bits |= (both.astype(np.uint16) << np.uint16(bit))
+
+        extra_out.update(stats)
+        extra_out.update({
+            "principal_axes_lengths": principal_axes_lengths,
+            "axis_ratios": axis_ratios,
+            "orientation": orientation,
+            "face_presence": presence,
+            "face_pair_bits": pair_bits,
+            "shell_t": np.int32(3),
+            "shell_xneg": labels[0:3, :, :].astype(np.uint32, copy=False),
+            "shell_xpos": labels[-3:, :, :].astype(np.uint32, copy=False),
+            "shell_yneg": labels[:, 0:3, :].astype(np.uint32, copy=False),
+            "shell_ypos": labels[:, -3:, :].astype(np.uint32, copy=False),
+            "shell_zneg": labels[:, :, 0:3].astype(np.uint32, copy=False),
+            "shell_zpos": labels[:, :, -3:].astype(np.uint32, copy=False),
+        })
     ni_c, nj_c, nk_c = labels.shape
     if overlap_width != 1:
         raise NotImplementedError("overlap_width > 1 not yet supported")
@@ -367,27 +399,6 @@ def main():
     face_zneg = labels[:, :, 0].astype(np.uint32, copy=False)
     face_zpos = labels[:, :, -1].astype(np.uint32, copy=False)
 
-    # Optional per-label face presence [K, 6] and 15-bit face-pair mask [K]
-    if K:
-        presence = np.zeros((K, 6), dtype=bool)
-        # indices are 1-based labels; map into 0-based rows safely
-        for idx, arr in enumerate((face_xneg, face_xpos, face_yneg, face_ypos, face_zneg, face_zpos)):
-            u = np.unique(arr)
-            u = u[(u > 0) & (u <= K)]
-            presence[u - 1, idx] = True
-        pair_bits = np.zeros((K,), dtype=np.uint16)
-        pairs = [(0,1),(0,2),(0,3),(0,4),(0,5),
-                 (1,2),(1,3),(1,4),(1,5),
-                 (2,3),(2,4),(2,5),
-                 (3,4),(3,5),
-                 (4,5)]
-        for bit, (a, b) in enumerate(pairs):
-            both = presence[:, a] & presence[:, b]
-            pair_bits |= (both.astype(np.uint16) << np.uint16(bit))
-    else:
-        presence = np.zeros((0, 6), dtype=bool)
-        pair_bits = np.zeros((0,), dtype=np.uint16)
-
     out = {
         "label_ids": rank_ids,
         "cell_count": cell_count,
@@ -401,6 +412,8 @@ def main():
         "voxel_spacing": np.array([dx, dy, dz], dtype=np.float64),
         "origin": np.array(origin, dtype=np.float64),
         "connectivity": np.int32(connectivity),
+        "velocity_mean": v_mean,
+        "velocity_std": v_std,
         # Threshold provenance
         "cut_by": np.array(cut_by),
         "cut_op": np.array(cut_op),
@@ -417,9 +430,6 @@ def main():
         "ovlp_ypos": ovlp_ypos,
         "ovlp_zneg": ovlp_zneg,
         "ovlp_zpos": ovlp_zpos,
-        "principal_axes_lengths": principal_axes_lengths,
-        "axis_ratios": axis_ratios,
-        "orientation": orientation,
         # Stitching faces
         "face_xneg": face_xneg,
         "face_xpos": face_xpos,
@@ -427,19 +437,9 @@ def main():
         "face_ypos": face_ypos,
         "face_zneg": face_zneg,
         "face_zpos": face_zpos,
-        # Diagnostics: per-label face presence; Stitch assists: per-label face-pair bits
-        "face_presence": presence,
-        "face_pair_bits": pair_bits,
-        # Exact shell mode (t=3) boundary shells from UNFILTERED labels
-        "shell_t": np.int32(3),
-        "shell_xneg": labels[0:3, :, :].astype(np.uint32, copy=False),
-        "shell_xpos": labels[-3:, :, :].astype(np.uint32, copy=False),
-        "shell_yneg": labels[:, 0:3, :].astype(np.uint32, copy=False),
-        "shell_ypos": labels[:, -3:, :].astype(np.uint32, copy=False),
-        "shell_zneg": labels[:, :, 0:3].astype(np.uint32, copy=False),
-        "shell_zpos": labels[:, :, -3:].astype(np.uint32, copy=False),
     }
-    out.update(stats)
+    if extra_out:
+        out.update(extra_out)
 
     part_path = os.path.join(out_dir, f"clumps_rank{rank:05d}.npz")
     np.savez(part_path, **out)
@@ -487,6 +487,7 @@ def main():
             "overlap_width": int(overlap_width),
             "min_clump_cells_deferred": int(min_cells),
         },
+        "extra_stats": bool(extra_stats),
         "git_rev": _git_rev(),
         "config": cfg,
         "output_npz": os.path.basename(part_path),
@@ -494,21 +495,8 @@ def main():
     with open(os.path.join(out_dir, f"clumps_rank{rank:05d}.meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    if rank == 0 or cfg.get("profile", False) or args.profile:
+    if rank == 0 or cfg.get("profile", False):
         print(f"rank={rank} times: load={t_load-t0:.2f}s label={t_label-t_load:.2f}s reduce={t_done-t_label:.2f}s K={K}")
-
-    # Optional aggregate + plot on rank 0
-    comm.Barrier()
-    if args.auto_aggregate_plot and rank == 0:
-        try:
-            from aggregate_results import aggregate
-            from plot_clumps import make_pngs
-            master = os.path.join(out_dir, "clumps_master.npz")
-            aggregate(out_dir, master)
-            make_pngs(master, out_dir, use_volume=False, mass_weighted=False)
-            print(f"Aggregated and wrote PNG plots to {out_dir}")
-        except Exception as e:
-            print(f"Auto-aggregate-plot failed: {e}")
 
 
 if __name__ == "__main__":

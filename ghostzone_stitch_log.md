@@ -30,3 +30,13 @@
 - Fixed `local_label.label_3d` global tiling bug: background voxels in tiles beyond the first were offset by `gbase`, causing massive overcounts once N exceeded `tile_shape`. Limited the offset to positive labels only.
 - Re-validated `_write_parts` total cell coverage; per-tile sums now match the baseline for large grids (e.g., N=320).
 - Large-scale equivalence runs (N=320 with (2,2,2) and (2,2,5) decompositions) now pass with the enhanced diagnostics staying quiet.
+
+## 2025-11-01 01:12 CET
+- Pruned `clump_finder.py` down to the overlap-only data required by the streamlined stitcher: removed legacy CLI knobs, per-label stats, shape tensors, face bitmasks, and shell exports.
+- Simplified volume loading to avoid unused velocity slices and redundant arrays in the saved NPZ payloads.
+- Re-ran `python tests/test_equivalence_no_mpi.py --N 320 --px 2 --py 2 --pz 5 --overlap 1 --beta -3.5 --field-type powerlaw`; temperature and density cuts still match the baseline.
+
+## 2025-11-01 01:29 CET
+- Restored velocity magnitude mean/std outputs as default per-clump diagnostics and added `--extra-stats` (plus config toggle) to regenerate the full metric suite on demand.
+- Optional extras now cover per-field higher moments, mass-weighted shape tensors, face bitmasks, and overlap shells without bloating the default path.
+- Verified equivalence after the toggleable stats refactor using `python tests/test_equivalence_no_mpi.py --N 320 --px 2 --py 2 --pz 5 --overlap 1 --beta -3.5 --field-type powerlaw`.
