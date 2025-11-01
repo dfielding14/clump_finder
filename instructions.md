@@ -15,28 +15,37 @@
 
 ## 1) Repository Layout
 
-Everything lives under `clump_finder/`:
+High-level organization:
 
 ```
-clump_finder/
-├── instructions.md                         # this document
+clump_find_drummond/
+├── README.md
+├── instructions.md
 ├── clump_finder.py                         # MPI entrypoint (driver)
-├── config.yaml                             # runtime parameters (paths, thresholds, tiling)
+├── io_bridge.py                            # openPMD I/O wrapper (code units; optional ghost zones)
 ├── local_label.py                          # node-local 3D connected components (Numba)
 ├── metrics.py                              # per-label reductions, centroids, shapes, area
 ├── stitch.py                               # (future) cross-node merge design + helpers (feature-flagged)
-├── io_bridge.py                            # openPMD I/O wrapper (code units; optional ghost zones)
-├── aggregate_results.py                    # reduces per-node .npz into one master .npz
-├── slurm/
-│   └── frontier_clump.sbatch               # SLURM template for Frontier (site lines TBD)
-└── requirements.txt                        # likely unused (env already provisioned)
+├── configs/
+│   ├── base/                               # canonical defaults (e.g., configs/base/config.yaml)
+│   ├── presets/                            # resolution presets (config_nXXXX.yaml)
+│   └── runs/                               # sweep- or campaign-specific groups
+├── jobs/
+│   └── slurm/
+│       └── frontier/                       # site-ready sbatch scripts
+├── scripts/
+│   └── analysis/                           # aggregation, PCA, correlations, plotting helpers
+├── analysis/                               # long-lived analysis artifacts (logs/, PNGs, etc.)
+├── clump_out/                              # run outputs (git-ignored)
+├── logs/                                   # runtime logs (git-ignored)
+└── requirements.txt
 ```
 
 > **Important (updated):** `io_bridge.py` is implemented using `openpmd-api` directly (based on your provided snippets). It returns `dens`, `temp`, `velx`, `vely`, `velz` in code units. Dataset axis order is `[nz,ny,nx]` and outputs are `[i,j,k]` with `i→x`, `j→y`, `k→z`. Optional ghost zones overlap neighbor subvolumes and wrap at the global domain boundary only (no local subvolume wrap or clamping/zeros).
 
 ---
 
-## 2) Configuration (config.yaml)
+## 2) Configuration (configs/base/config.yaml)
 
 Example keys (tune as needed; agent should implement a parser):
 
@@ -273,7 +282,7 @@ Store compact arrays keyed by label id (length `K` each). Suggested schema:
 
 ## 7) Frontier SLURM Template (to adapt)
 
-`slurm/frontier_clump.sbatch`:
+`jobs/slurm/frontier/frontier_clump.sbatch`:
 
 ```bash
 #!/bin/bash
@@ -299,14 +308,14 @@ export NUMEXPR_NUM_THREADS=1
 
 set -euo pipefail
 
-CONF=${CONF:-config.yaml}
+CONF=${CONF:-configs/base/config.yaml}
 
 srun -N ${SLURM_NNODES} -n ${SLURM_NNODES} \
      python -u clump_finder.py --config "${CONF}"
 
 # optional separate aggregation step if you prefer:
 # if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
-#     python -u aggregate_results.py --input ./clump_out --output ./clump_out/clumps_master.npz
+#     python -u scripts/analysis/aggregate_results.py --input ./clump_out --output ./clump_out/clumps_master.npz
 # fi
 ```
 
@@ -328,12 +337,12 @@ Per rank (node):
    * stats for `rho, T, vx, vy, vz, pressure` (pressure computed on the fly) — both volume‑ and mass‑weighted by default
    * `bbox_ijk` (global; [min,max) per axis), axis lengths/ratios/orientations (saved as dedicated arrays)
 6. **Write per‑node `.npz`** (`clumps_rank%05d.npz`).
-7. Optional: Rank 0 runs `aggregate_results.py` to build `clumps_master.npz`.
+7. Optional: Rank 0 runs `scripts/analysis/aggregate_results.py` to build `clumps_master.npz`.
 
 **CLI** (implement with `argparse`):
 
 ```
-python clump_finder.py --config config.yaml [--dry-run] [--profile]
+python clump_finder.py --config configs/base/config.yaml [--dry-run] [--profile]
 ```
 
 ---
@@ -463,7 +472,7 @@ def exposed_area(labels, dx, dy, dz):
 
 ---
 
-## 10) Aggregation (`aggregate_results.py`)
+## 10) Aggregation (`scripts/analysis/aggregate_results.py`)
 
 * Scan `output_dir` for `clumps_rank*.npz`.
 * For each, build a **global id** `gid = (rank << 32) | label_id`.
@@ -540,19 +549,19 @@ tqdm
 
 ```bash
 # Dry run (discover geometry; no compute)
-python clump_finder.py --config config.yaml --dry-run
+python clump_finder.py --config configs/base/config.yaml --dry-run
 
 # Production (via SLURM template above)
-sbatch slurm/frontier_clump.sbatch
+sbatch jobs/slurm/frontier/frontier_clump.sbatch
 
 # Aggregate later (if not done in-job)
-python aggregate_results.py --input ./clump_out --output ./clump_out/clumps_master.npz
+python scripts/analysis/aggregate_results.py --input ./clump_out --output ./clump_out/clumps_master.npz
 
 # Plot clump size and size-vs-velocity dispersion (from a .npz)
-python plot_clumps.py --input ./clump_out/clumps_master.npz --output ./clump_out/clumps_master_plots.pdf
+python scripts/analysis/plot_clumps.py --input ./clump_out/clumps_master.npz --outdir ./clump_out
 
 # End-to-end: compute then auto-aggregate+plot (single command)
-python clump_finder.py --config config.yaml --auto-aggregate-plot
+python clump_finder.py --config configs/base/config.yaml --auto-aggregate-plot
 ```
 
 ---
@@ -577,7 +586,7 @@ python clump_finder.py --config config.yaml --auto-aggregate-plot
 
 ## 18) Plotting
 
-`plot_clumps.py` creates a multi-page PDF with:
+`scripts/analysis/plot_clumps.py` creates a multi-page PDF with:
 
 - Histogram of clump sizes (`cell_count` by default; `--use-volume` for volume).
 - 2D histograms of size versus velocity dispersion (`sqrt(vx_std²+vy_std²+vz_std²)`) and per-component stds.
@@ -585,8 +594,8 @@ python clump_finder.py --config config.yaml --auto-aggregate-plot
 Examples:
 
 ```bash
-python plot_clumps.py --input ./clump_out/clumps_rank00000.npz
-python plot_clumps.py --input ./clump_out/clumps_master.npz --use-volume --mass-weighted
+python scripts/analysis/plot_clumps.py --input ./clump_out/clumps_rank00000.npz
+python scripts/analysis/plot_clumps.py --input ./clump_out/clumps_master.npz --use-volume --mass-weighted
 ```
 
 You can also run the driver with `--auto-aggregate-plot` to automatically aggregate and emit a PDF on rank 0.

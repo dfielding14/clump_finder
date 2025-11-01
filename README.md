@@ -16,7 +16,7 @@ The driver follows a simple but memory‑aware pipeline so we can work on Fronti
 
 5. **Metrics and statistics.** `metrics.py` reduces per‑label quantities: cell counts, volumes/masses, exposed surface area, centroids, velocity statistics, and principal axes. We ingest data as float32 to save RAM, but accumulations (weights, covariances) stay in float64 to preserve accuracy on large tiles.
 
-6. **Persistence.** Each rank writes one `.npz` plus a JSON meta file (bounding box, timings, config snapshot). An optional master step (`aggregate_results.py`) concatenates per‑rank outputs and writes a global catalog.
+6. **Persistence.** Each rank writes one `.npz` plus a JSON meta file (bounding box, timings, config snapshot). An optional master step (`scripts/analysis/aggregate_results.py`) concatenates per-rank outputs and writes a global catalog.
 
 7. **Visualization.** `plot_clumps.py` generates quick‑look PNGs: size histogram, size vs velocity dispersion, and a diagnostic of surface area versus volume (`area / volume^{2/3}`).
 
@@ -30,26 +30,26 @@ Key design choices:
 ## Quick Start
 
 - Install deps (site modules or pip):
-  - See `clump_finder/requirements.txt`
+  - See `requirements.txt`
 
-- Configure `clump_finder/config.yaml`:
+- Configure `configs/base/config.yaml`:
   - Set `dataset_path`, `step`, `Nres`, `temperature_threshold`.
-  - Optional: `assert_nres_from_data: true` to validate/override `Nres` from the dataset shape.
+  - Optional: set `assert_nres_from_data: true` to validate/override `Nres` from the dataset shape.
 
 - Dry run (no I/O):
 ```
-python clump_finder.py --config config.yaml --dry-run
+python clump_finder.py --config configs/base/config.yaml --dry-run
 ```
 
 - Run (single node):
 ```
-python clump_finder.py --config config.yaml --auto-aggregate-plot
+python clump_finder.py --config configs/base/config.yaml --auto-aggregate-plot
 ```
 
 - Aggregate later and plot:
 ```
-python aggregate_results.py --input ./clump_out --output ./clump_out/clumps_master.npz --sidecar ./clump_out/master_meta.json
-python plot_clumps.py --input ./clump_out/clumps_master.npz --outdir ./clump_out
+python scripts/analysis/aggregate_results.py --input ./clump_out --output ./clump_out/clumps_master.npz --sidecar ./clump_out/master_meta.json
+python scripts/analysis/plot_clumps.py --input ./clump_out/clumps_master.npz --outdir ./clump_out
 ```
 
 - Synthetic 128³ power-law test (no I/O):
@@ -75,7 +75,7 @@ Sidecar (optional): JSON with part list and clump count.
 
 - Use one rank per node:
 ```
-sbatch slurm/frontier_clump.sbatch
+sbatch jobs/slurm/frontier/frontier_clump.sbatch
 ```
 - Edit the SLURM script to load your site modules or virtual env.
 - Environment hints:

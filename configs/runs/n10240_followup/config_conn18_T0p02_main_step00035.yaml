@@ -1,0 +1,35 @@
+Nres: 10240
+accum_dtype: float64
+assert_nres_from_data: true
+connectivity: 18
+dataset_path: /lustre/orion/ast207/proj-shared/mpturb/clumpn5120to10240_cont_prepeak/parthenon.opmd.00035.bp/
+dx: null
+dy: null
+dz: null
+field_dtype: float32
+gamma: 1.6666666666666667
+ghost_width: 1
+intra_node_threads: 56
+log_dir: logs/clumpn10240_followup/main_step00035
+min_clump_cells: 8
+mpi_mode: one_rank_per_node
+origin:
+- 0.0
+- 0.0
+- 0.0
+output_dir: clump_out/clumpn10240_followup/main_step00035
+periodic:
+- true
+- true
+- true
+profile: false
+save_per_clump_voxel_bbox: true
+save_pressure: false
+step: 35
+stitch_flag: false
+temperature_threshold: 0.02
+tile_shape:
+- 1280
+- 1280
+- 1280
+verify_one_rank_per_node: true

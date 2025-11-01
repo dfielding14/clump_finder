@@ -7,9 +7,9 @@ output_dir: ./clump_out/clumpn10240_step35
 log_dir: ./logs
 
 # Selection (code units)
-temperature_threshold: 0.1
-connectivity: 6
-min_clump_cells: 27
+temperature_threshold: 0.02
+connectivity: 18
+min_clump_cells: 8
 
 # Geometry (cubic grid)
 Nres: 10240
