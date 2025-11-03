@@ -1,0 +1,45 @@
+# Configuration for clump finder on the n1280 dataset
+
+# Input/output
+dataset_path: /lustre/orion/ast207/proj-shared/mpturb/clumpn1280/parthenon.opmd.00035.bp/
+step: 35
+output_dir: ./clump_out/clumpn1280_step35
+log_dir: ./logs
+
+# Selection (code units)
+temperature_threshold: 0.1
+connectivity: 6
+min_clump_cells: 27
+
+# Geometry (cubic grid)
+Nres: 1280
+dx: null
+dy: null
+dz: null
+origin: [0.0, 0.0, 0.0]
+periodic: [true, true, true]
+assert_nres_from_data: true
+
+# Parallelism
+intra_node_threads: 56
+mpi_mode: "one_rank_per_node"
+verify_one_rank_per_node: true
+
+# Tiling inside a node (single tile covering the full domain)
+tile_shape: [1280, 1280, 1280]
+
+# Memory / precision
+field_dtype: float32
+accum_dtype: float64
+
+# Output content
+save_pressure: false
+save_per_clump_voxel_bbox: true
+
+# Ghost zones
+ghost_width: 1
+stitch_flag: false
+
+# Misc
+gamma: 1.6666666666666667
+profile: false
