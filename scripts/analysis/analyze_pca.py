@@ -16,39 +16,17 @@ import numpy as np
 from sklearn.decomposition import PCA, FactorAnalysis
 from sklearn.preprocessing import StandardScaler
 
+from feature_utils import load_features
+
 
 DEFAULT_FEATURES = [
     "volume",
-    "vx_mean",
-    "vx_std",
-    "rho_mean",
-    "rho_std",
-    "pressure_mean",
-    "pressure_std",
+    "mass",
+    "area",
+    "cell_count",
+    "velocity_std",
+    "velocity_mean",
 ]
-
-
-def _flatten_feature(name: str, value: np.ndarray) -> np.ndarray:
-    if value.ndim == 1:
-        return value
-    if name == "principal_axes_lengths":
-        return np.max(value, axis=1)
-    if name == "axis_ratios":
-        return value[:, 0]
-    raise ValueError(f"Cannot flatten feature {name} with shape {value.shape}")
-
-
-def load_features(files: List[str], features: List[str]) -> Dict[str, np.ndarray]:
-    stacked = {f: [] for f in features}
-    for path in files:
-        with np.load(path) as data:
-            for feat in features:
-                if feat not in data:
-                    raise KeyError(f"{feat} missing in {path}")
-                arr = np.asarray(data[feat], dtype=np.float64)
-                arr = _flatten_feature(feat, arr)
-                stacked[feat].append(arr)
-    return {k: np.concatenate(v) for k, v in stacked.items()}
 
 
 def build_matrix(feature_dict: Dict[str, np.ndarray]) -> np.ndarray:
@@ -128,7 +106,10 @@ def main() -> None:
     if not files:
         raise SystemExit(f"No clumps_master.npz found under {args.input_root}")
 
-    features = load_features(files, args.features)
+    try:
+        features = load_features(files, args.features)
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
     matrix = build_matrix(features)
 
     scores, components, model = run_analysis(matrix, args.mode, args.components)

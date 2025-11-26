@@ -1,0 +1,35 @@
+Nres: 1280
+accum_dtype: float64
+assert_nres_from_data: true
+connectivity: 6
+dataset_path: /lustre/orion/ast207/proj-shared/mpturb/clumpn1280/parthenon.opmd.00024.bp/
+dx: null
+dy: null
+dz: null
+field_dtype: float32
+gamma: 1.6666666666666667
+ghost_width: 1
+intra_node_threads: 56
+log_dir: logs/n1280_sweep/conn6_T0p02_step00024
+min_clump_cells: 8
+mpi_mode: one_rank_per_node
+origin:
+- 0.0
+- 0.0
+- 0.0
+output_dir: clump_out/n1280_sweep/conn6_T0p02_step00024
+periodic:
+- true
+- true
+- true
+profile: false
+save_per_clump_voxel_bbox: true
+save_pressure: false
+step: 24
+stitch_flag: false
+temperature_threshold: 0.02
+tile_shape:
+- 640
+- 640
+- 640
+verify_one_rank_per_node: true

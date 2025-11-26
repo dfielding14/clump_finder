@@ -8,6 +8,7 @@ import matplotlib
 matplotlib.use("agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from typing import Optional, Tuple
 
 
 def _load(path: str) -> dict[str, np.ndarray]:
@@ -86,6 +87,84 @@ def _hist2d(ax, x, y, bins=100, xlog=True, ylog=True, xlabel=None, ylabel=None, 
     ax.set_ylabel(ylabel or 'y')
 
 
+def _load_size(npz_path: str, use_volume: bool) -> np.ndarray:
+    with np.load(npz_path) as d:
+        key = "volume" if use_volume else "cell_count"
+        if key not in d:
+            raise KeyError(f"{key} missing in {npz_path}")
+        arr = np.asarray(d[key], dtype=np.float64)
+    mask = np.isfinite(arr) & (arr > 0)
+    return arr[mask]
+
+
+def plot_histogram_comparison(primary_path: str, secondary_path: str, outdir: str,
+                              use_volume: bool, labels: Optional[Tuple[str, str]] = None) -> None:
+    size_primary = _load_size(primary_path, use_volume)
+    size_secondary = _load_size(secondary_path, use_volume)
+
+    if size_primary.size == 0 or size_secondary.size == 0:
+        print("[plot_clumps] Skipping histogram comparison; one input has no positive sizes.")
+        return
+
+    combined = np.concatenate([size_primary, size_secondary])
+    xmin = combined.min()
+    xmax = combined.max()
+    bins = np.logspace(np.log10(xmin), np.log10(xmax), 80)
+
+    hist_primary, _ = np.histogram(size_primary, bins=bins)
+    hist_secondary, _ = np.histogram(size_secondary, bins=bins)
+    log_width = np.log(bins[1:]) - np.log(bins[:-1])
+    v_mid = np.sqrt(bins[1:] * bins[:-1])
+    spec_primary = np.divide(v_mid * hist_primary, log_width,
+                             out=np.full_like(hist_primary, np.nan, dtype=np.float64),
+                             where=log_width > 0)
+    spec_secondary = np.divide(v_mid * hist_secondary, log_width,
+                               out=np.full_like(hist_secondary, np.nan, dtype=np.float64),
+                               where=log_width > 0)
+    ratio = np.divide(
+        spec_secondary,
+        spec_primary,
+        out=np.full_like(hist_secondary, np.nan, dtype=np.float64),
+        where=(spec_primary > 0),
+    )
+    total_primary = np.sum(size_primary)
+    total_secondary = np.sum(size_secondary)
+
+    base_primary = os.path.splitext(os.path.basename(primary_path))[0]
+    base_secondary = os.path.splitext(os.path.basename(secondary_path))[0]
+    if labels:
+        label_primary, label_secondary = labels
+    else:
+        label_primary = base_primary
+        label_secondary = base_secondary
+    label_primary = f"{label_primary} (∑ volume = {total_primary:.3e})"
+    label_secondary = f"{label_secondary} (∑ volume = {total_secondary:.3e})"
+
+    centers = bins[:-1]
+    fig, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(7, 8), sharex=True, dpi=150)
+
+    ax_top.step(centers, spec_primary, where='post', label=label_primary, color='tab:blue')
+    ax_top.step(centers, spec_secondary, where='post', label=label_secondary, color='tab:orange')
+    ax_top.set_xscale('log')
+    ax_top.set_yscale('log')
+    ax_top.set_ylabel('V · dN / dlog V')
+    ax_top.legend()
+    ax_top.set_title('Clump size histogram comparison')
+
+    ax_bottom.step(centers, ratio, where='post', color='tab:purple')
+    ax_bottom.axhline(1.0, color='black', linestyle='--', linewidth=1)
+    ax_bottom.set_xscale('log')
+    ax_bottom.set_xlabel('V [Δx^3]')
+    ax_bottom.set_ylabel('ratio (secondary / primary)')
+
+    fig.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
+    compare_name = f"{base_primary}_size_hist_compare.png"
+    fig.savefig(os.path.join(outdir, compare_name), bbox_inches='tight')
+    plt.close(fig)
+    print(f"[plot_clumps] Wrote comparison histogram {compare_name}")
+
+
 def find_ell_bin_edges(r_min: int, r_max: int, n_ell_bins: int) -> np.ndarray:
     """Compute integer-rounded geometric bin edges with exactly n_ell_bins bins.
 
@@ -118,59 +197,73 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
     d = _load(npz_path)
     size = d['volume'] if use_volume else d['cell_count']
     if mass_weighted:
-        vx_std = d.get('vx_std_massw', None)
-        vy_std = d.get('vy_std_massw', None)
-        vz_std = d.get('vz_std_massw', None)
+        vx_std = d.get('vx_std_massw')
+        vy_std = d.get('vy_std_massw')
+        vz_std = d.get('vz_std_massw')
     else:
-        vx_std = d.get('vx_std', None)
-        vy_std = d.get('vy_std', None)
-        vz_std = d.get('vz_std', None)
+        vx_std = d.get('vx_std')
+        vy_std = d.get('vy_std')
+        vz_std = d.get('vz_std')
+    velocity_std_scalar = d.get('velocity_std')
 
-    if vx_std is None or vy_std is None or vz_std is None:
-        raise KeyError('Velocity std fields not found in npz')
-    vdisp = np.sqrt(vx_std**2 + vy_std**2 + vz_std**2)
+    have_velocity = False
+    vdisp = None
+    if vx_std is not None and vy_std is not None and vz_std is not None:
+        vdisp = np.sqrt(vx_std**2 + vy_std**2 + vz_std**2)
+        have_velocity = True
+    elif velocity_std_scalar is not None:
+        vdisp = velocity_std_scalar.astype(np.float64, copy=False)
+        have_velocity = True
 
     os.makedirs(outdir, exist_ok=True)
     base = prefix or (os.path.splitext(os.path.basename(npz_path))[0])
 
-    # 1) Size histogram
+    # 1) Size spectrum: V * dN/dlogV
     fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
     # Choose bins: integer-rounded geometric edges for integer sizes; logspace for floats
     if (np.issubdtype(size.dtype, np.integer)) or np.allclose(size, np.round(size)):
         r_min = int(max(1, np.nanmin(size)))
         r_max = int(np.nanmax(size))
         edges = find_ell_bin_edges(r_min, r_max, n_ell_bins=60)
-        ax.hist(size, bins=edges, histtype='stepfilled', alpha=0.85)
     else:
         lo = np.nanmin(size[size > 0]) if np.any(size > 0) else 1.0
         hi = np.nanmax(size)
         edges = np.logspace(np.log10(lo), np.log10(hi), 60)
-        ax.hist(size, bins=edges, histtype='stepfilled', alpha=0.85)
+    counts, _ = np.histogram(size, bins=edges)
+    log_width = np.log(edges[1:]) - np.log(edges[:-1])
+    v_mid = np.sqrt(edges[1:] * edges[:-1])
+    spectrum = np.divide(v_mid * counts, log_width,
+                         out=np.full_like(counts, np.nan, dtype=np.float64),
+                         where=log_width > 0)
+    ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
     ax.set_xscale('log')
     ax.set_yscale('log')
-    ax.set_xlabel('clump size ({})'.format('volume' if use_volume else 'cell_count'))
-    ax.set_ylabel('count')
-    ax.set_title('Clump size distribution (K={})'.format(size.shape[0]))
+    ax.set_xlabel('V [Δx^3]')
+    ax.set_ylabel('V · dN / dlog V')
+    ax.set_title('Clump size spectrum (K={})'.format(size.shape[0]))
     fig.savefig(os.path.join(outdir, f"{base}_size_hist.png"), bbox_inches='tight')
     plt.close(fig)
 
     # 2) Size vs velocity dispersion
-    fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
-    # X-axis edges consistent with size histogram
-    if (np.issubdtype(size.dtype, np.integer)) or np.allclose(size, np.round(size)):
-        r_min = int(max(1, np.nanmin(size)))
-        r_max = int(np.nanmax(size))
-        xedges = find_ell_bin_edges(r_min, r_max, n_ell_bins=60)
+    if have_velocity and vdisp is not None:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+        # X-axis edges consistent with size histogram
+        if (np.issubdtype(size.dtype, np.integer)) or np.allclose(size, np.round(size)):
+            r_min = int(max(1, np.nanmin(size)))
+            r_max = int(np.nanmax(size))
+            xedges = find_ell_bin_edges(r_min, r_max, n_ell_bins=60)
+        else:
+            lo = np.nanmin(size[size > 0]) if np.any(size > 0) else 1.0
+            hi = np.nanmax(size)
+            xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
+        _hist2d(ax, size, vdisp, bins=100, xlog=True, ylog=True,
+                xlabel='clump size ({})'.format('volume' if use_volume else 'cell_count'),
+                ylabel='velocity dispersion (std |v|)', xedges=xedges)
+        ax.set_title('Size vs velocity dispersion')
+        fig.savefig(os.path.join(outdir, f"{base}_size_vs_vdisp.png"), bbox_inches='tight')
+        plt.close(fig)
     else:
-        lo = np.nanmin(size[size > 0]) if np.any(size > 0) else 1.0
-        hi = np.nanmax(size)
-        xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
-    _hist2d(ax, size, vdisp, bins=100, xlog=True, ylog=True,
-            xlabel='clump size ({})'.format('volume' if use_volume else 'cell_count'),
-            ylabel='velocity dispersion (std |v|)', xedges=xedges)
-    ax.set_title('Size vs velocity dispersion')
-    fig.savefig(os.path.join(outdir, f"{base}_size_vs_vdisp.png"), bbox_inches='tight')
-    plt.close(fig)
+        print(f"[plot_clumps] Skipping velocity dispersion plot for {npz_path}; velocity stats unavailable.")
 
     # 3) Area vs size joint distribution
     area = d.get('area')
@@ -184,7 +277,7 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
         if vol.size == 0:
             ax.text(0.5, 0.5, "No data", ha='center', va='center')
         else:
-            ratio = area_pos / np.power(vol, 2.0 / 3.0)
+            ratio = area_pos / np.power(vol, 8.0 / 9.0)
             # Filter out non-positive ratios before log scaling
             mask = ratio > 0
             vol = vol[mask]
@@ -196,9 +289,30 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
                 hi = np.nanmax(vol)
                 xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
                 _hist2d(ax, vol, ratio, bins=100, xlog=True, ylog=True,
-                        xlabel='clump volume', ylabel='area / volume$^{2/3}$', xedges=xedges)
-        ax.set_title('Normalized area vs volume')
-        fig.savefig(os.path.join(outdir, f"{base}_area_over_vol23_vs_volume.png"), bbox_inches='tight')
+                        xlabel='clump volume', ylabel='area / volume$^{8/9}$', xedges=xedges)
+        ax.set_title('Normalized area vs volume (8/9 power)')
+        fig.savefig(os.path.join(outdir, f"{base}_area_over_vol89_vs_volume.png"), bbox_inches='tight')
+        plt.close(fig)
+
+    # 4) Velocity dispersion vs volume (stitched catalogs only)
+    vel_std = d.get('velocity_std')
+    if vel_std is not None and volume_for_area is not None:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+        vol = volume_for_area.astype(np.float64, copy=False)
+        vel = vel_std.astype(np.float64, copy=False)
+        m = np.isfinite(vol) & np.isfinite(vel) & (vol > 0) & (vel > 0)
+        if m.any():
+            vol = vol[m]
+            vel = vel[m]
+            lo = np.nanmin(vol)
+            hi = np.nanmax(vol)
+            xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
+            _hist2d(ax, vol, vel, bins=100, xlog=True, ylog=True,
+                    xlabel='clump volume [Δx^3]', ylabel='velocity dispersion', xedges=xedges)
+            ax.set_title('Velocity dispersion vs volume')
+        else:
+            ax.text(0.5, 0.5, "No data", ha='center', va='center')
+        fig.savefig(os.path.join(outdir, f"{base}_velocity_std_vs_volume.png"), bbox_inches='tight')
         plt.close(fig)
 
     print(f"Wrote PNGs to {outdir}")
@@ -210,10 +324,21 @@ def main():
     ap.add_argument('--outdir', default=None, help='output directory for PNGs (default next to input)')
     ap.add_argument('--use-volume', action='store_true', help='use volume as clump size (default cell_count)')
     ap.add_argument('--mass-weighted', action='store_true', help='use mass-weighted stds')
+    ap.add_argument('--compare', default=None,
+                    help='optional secondary npz to compare size histogram against (stitched vs unstitched)')
+    ap.add_argument('--compare-labels', nargs=2, metavar=('PRIMARY', 'SECONDARY'),
+                    help='legend labels for --compare (defaults to basenames)')
+    ap.add_argument('--compare-outdir', default=None,
+                    help='output directory for comparison plot (defaults to --outdir)')
     args = ap.parse_args()
 
     outdir = args.outdir or os.path.dirname(args.input) or '.'
     make_pngs(args.input, outdir, use_volume=args.use_volume, mass_weighted=args.mass_weighted)
+
+    if args.compare:
+        compare_outdir = args.compare_outdir or outdir
+        labels = tuple(args.compare_labels) if args.compare_labels else None
+        plot_histogram_comparison(args.input, args.compare, compare_outdir, args.use_volume, labels)
 
 
 if __name__ == '__main__':

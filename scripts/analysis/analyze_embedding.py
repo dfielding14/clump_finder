@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import matplotlib
 
@@ -18,37 +18,16 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 
+from feature_utils import load_features
+
 DEFAULT_FEATURES = [
     "volume",
-    "vx_mean",
-    "vx_std",
-    "rho_mean",
-    "rho_std",
-    "pressure_mean",
-    "pressure_std",
+    "mass",
+    "area",
+    "cell_count",
+    "velocity_std",
+    "velocity_mean",
 ]
-
-
-def _flatten_feature(name: str, value: np.ndarray) -> np.ndarray:
-    if value.ndim == 1:
-        return value
-    if name == "principal_axes_lengths":
-        return np.max(value, axis=1)
-    if name == "axis_ratios":
-        return value[:, 0]
-    raise ValueError(f"Cannot flatten feature {name} with shape {value.shape}")
-
-
-def load_features(files: Iterable[str], features: List[str]) -> Dict[str, np.ndarray]:
-    stacked: Dict[str, List[np.ndarray]] = {feat: [] for feat in features}
-    for path in files:
-        with np.load(path) as data:
-            for feat in features:
-                if feat not in data:
-                    raise KeyError(f"{feat} missing in {path}")
-                arr = np.asarray(data[feat], dtype=np.float64)
-                stacked[feat].append(_flatten_feature(feat, arr))
-    return {k: np.concatenate(v) for k, v in stacked.items()}
 
 
 def build_matrix(feature_dict: Dict[str, np.ndarray]) -> np.ndarray:
@@ -157,7 +136,11 @@ def main() -> None:
     if not files:
         raise SystemExit(f"No clumps_master.npz files under {args.input_root}")
 
-    feature_dict = load_features(files, args.features)
+    try:
+        feature_dict = load_features(files, args.features)
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+    feature_names = list(feature_dict.keys())
     matrix = build_matrix(feature_dict)
 
     rng = np.random.default_rng(args.random_state)
@@ -200,14 +183,18 @@ def main() -> None:
     labels = fit_clustering(embedding, args.cluster, args.kmeans_k, args.dbscan_eps, args.min_samples)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    np.savez(os.path.join(args.output_dir, "embedding_results.npz"),
-             embedding=embedding, labels=labels, features=args.features)
+    np.savez(
+        os.path.join(args.output_dir, "embedding_results.npz"),
+        embedding=embedding,
+        labels=labels,
+        features=feature_names,
+    )
 
     scatter_with_labels(
         embedding, labels, os.path.join(args.output_dir, f"{args.embed}_{args.cluster}_clusters.png")
     )
 
-    for feat in args.features:
+    for feat in feature_names:
         scatter_colored_by_feature(
             embedding,
             feature_dict,

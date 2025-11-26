@@ -212,6 +212,8 @@ def stitch_reduce(input_dir: str, output_path: str):
     bbox[:, 0::2] = np.iinfo(np.int64).max
     bbox[:, 1::2] = np.iinfo(np.int64).min
     area = np.zeros(G, dtype=np.float64)
+    speed_w = np.zeros(G, dtype=np.float64)
+    speed_w2 = np.zeros(G, dtype=np.float64)
 
     for r, d in parts.items():
         lids = d["label_ids"].astype(np.int64)
@@ -226,6 +228,11 @@ def stitch_reduce(input_dir: str, output_path: str):
         np.add.at(volume, idx, vol)
         np.add.at(mass, idx, ms)
         np.add.at(area, idx, ar)
+        if "velocity_mean" in d and "velocity_std" in d:
+            v_mean_local = d["velocity_mean"].astype(np.float64, copy=False)
+            v_std_local = d["velocity_std"].astype(np.float64, copy=False)
+            np.add.at(speed_w, idx, v_mean_local * cc)
+            np.add.at(speed_w2, idx, (v_std_local * v_std_local + v_mean_local * v_mean_local) * cc)
 
         cv = d["centroid_vol"].astype(np.float64)
         cm = d["centroid_mass"].astype(np.float64)
@@ -260,6 +267,10 @@ def stitch_reduce(input_dir: str, output_path: str):
     centroid_mass = np.stack([Sxm / (mass + small),
                               Sym / (mass + small),
                               Szm / (mass + small)], axis=1)
+    speed_mean = speed_w / (cell_count + small)
+    speed_var = speed_w2 / (cell_count + small) - speed_mean * speed_mean
+    np.maximum(speed_var, 0.0, out=speed_var)
+    speed_std = np.sqrt(speed_var)
 
     out = {
         "gid": np.array(uniq_roots, dtype=np.uint64),
@@ -269,6 +280,8 @@ def stitch_reduce(input_dir: str, output_path: str):
         "area": area,
         "centroid_vol": centroid_vol,
         "centroid_mass": centroid_mass,
+        "velocity_mean": speed_mean,
+        "velocity_std": speed_std,
         "bbox_ijk": bbox.astype(np.int32),
         "voxel_spacing": np.array([dx, dy, dz], dtype=np.float64),
         "connectivity": np.int32(6),

@@ -25,8 +25,8 @@ intra_node_threads: 56
 mpi_mode: "one_rank_per_node"
 verify_one_rank_per_node: true
 
-# Tiling inside a node (single tile covering the full domain)
-tile_shape: [1280, 1280, 1280]
+# Tiling inside a node (half-domain bricks to pair with a 2x2 decomposition)
+tile_shape: [640, 640, 640]
 
 # Memory / precision
 field_dtype: float32

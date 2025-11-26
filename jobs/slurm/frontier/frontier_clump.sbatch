@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH -J clumpn640_cf
+#SBATCH -J clumpn1280_cf
 #SBATCH -A AST207
 #SBATCH -p batch
 #SBATCH --qos debug
-#SBATCH --qos debug
-#SBATCH -N 1
+#SBATCH -N 4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=56
-#SBATCH -t 00:30:00
+#SBATCH -t 01:00:00
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -21,7 +20,7 @@ PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "${PROJECT_ROOT}"
 
 mkdir -p logs
-mkdir -p clump_out/clumpn640_step35
+mkdir -p clump_out/clumpn1280_step35
 
 echo "======================================"
 echo "Clump finder run starting at $(date)"
@@ -33,7 +32,7 @@ echo "Python: $(which python)"
 python --version
 echo "Workdir: ${PWD}"
 echo "Project root: ${PROJECT_ROOT}"
-echo "Config : ${CONF:-configs/base/config.yaml}"
+echo "Config : ${CONF:-configs/config_n1280.yaml}"
 echo "======================================"
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
@@ -43,10 +42,16 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export MPICH_OFI_NIC_POLICY=BLOCK
 
-CONF=${CONF:-configs/base/config.yaml}
-OUT_DIR="clump_out/clumpn640_step35"
+CONF=${CONF:-configs/config_n1280.yaml}
+OUT_DIR="clump_out/clumpn1280_step35"
 MASTER_NPZ="${OUT_DIR}/clumps_master.npz"
 MASTER_JSON="${OUT_DIR}/clumps_master.meta.json"
+STITCHED_NPZ="${OUT_DIR}/clumps_stitched.npz"
+STITCHED_PLOTS="${OUT_DIR}/stitched_plots"
+
+# Synthetic smoke check on synthetic data to validate stitching logic
+echo "Running synthetic equivalence smoke test at $(date)"
+python -u tests/test_equivalence_no_mpi.py --N 64 --px 2 --py 2 --pz 1
 
 srun -N ${SLURM_NNODES} -n ${SLURM_NNODES} --cpu-bind=cores \
      python -u clump_finder.py --config "${CONF}"
@@ -57,7 +62,19 @@ python -u scripts/analysis/aggregate_results.py \
     --output "${MASTER_NPZ}" \
     --sidecar "${MASTER_JSON}"
 
+echo "Running overlap-exact stitching at $(date)"
+python -u stitch.py \
+    --input "${OUT_DIR}" \
+    --output "${STITCHED_NPZ}"
+
 echo "Generating plots at $(date)"
 python -u scripts/analysis/plot_clumps.py \
     --input "${MASTER_NPZ}" \
-    --outdir "${OUT_DIR}"
+    --outdir "${OUT_DIR}" \
+    --compare "${STITCHED_NPZ}" \
+    --compare-labels "Unstitched" "Stitched"
+
+echo "Plotting stitched results at $(date)"
+python -u scripts/analysis/plot_clumps.py \
+    --input "${STITCHED_NPZ}" \
+    --outdir "${STITCHED_PLOTS}"

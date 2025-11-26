@@ -12,8 +12,10 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+from pathlib import Path
 from itertools import combinations
 from typing import Dict, List, Tuple
+import re
 
 import matplotlib
 
@@ -21,46 +23,42 @@ matplotlib.use("agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-SELECTED_FEATURES = [
+from feature_utils import load_features
+
+DEFAULT_FEATURES = [
     "volume",
     "mass",
     "area",
-    "pressure_mean",
-    "rho_mean",
-    "vx_std",
+    "cell_count",
+    "velocity_std",
+    "velocity_mean",
 ]
 
 DISPLAY_LABELS = {
     "volume": "Volume",
     "mass": "Mass",
     "area": "Area",
-    "pressure_mean": "pressure_mean",
-    "rho_mean": "rho_mean",
-    "vx_std": "vx_std",
+    "cell_count": "Cell count",
+    "num_cells": "Cell count",
+    "velocity_std": "Velocity σ",
+    "velocity_mean": "⟨v⟩",
 }
 
 
-def _flatten_feature(name: str, value: np.ndarray) -> np.ndarray:
-    if value.ndim == 1:
-        return value
-    if name == "principal_axes_lengths":
-        return np.max(value, axis=1)
-    if name == "axis_ratios":
-        return value[:, 0]  # choose b/a
-    raise ValueError(f"Cannot flatten feature {name} with shape {value.shape}")
-
-
-def load_features(files: List[str], features: List[str]) -> Dict[str, np.ndarray]:
-    stacked: Dict[str, List[np.ndarray]] = {f: [] for f in features}
-    for path in files:
-        with np.load(path) as data:
-            for feat in features:
-                if feat not in data:
-                    raise KeyError(f"{feat} missing in {path}")
-                arr = np.asarray(data[feat])
-                arr = _flatten_feature(feat, arr)
-                stacked[feat].append(arr.astype(np.float64, copy=False))
-    return {k: np.concatenate(v, axis=0) for k, v in stacked.items()}
+def _sanitize_label(label: str) -> str:
+    replacements = {
+        "⟨v⟩": "v_mean",
+        "σ": "sigma",
+        " ": "_",
+        "-": "_",
+    }
+    sanitized = label
+    for old, new in replacements.items():
+        sanitized = sanitized.replace(old, new)
+    sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", sanitized).strip("_")
+    if not sanitized:
+        sanitized = "feature"
+    return sanitized.lower()
 
 
 def compute_correlation_matrix(feature_dict: Dict[str, np.ndarray]) -> np.ndarray:
@@ -150,7 +148,7 @@ def plot_pair_histograms(
                         label=f"∝ {x_key}^{slope:.2f}")
         ax.legend()
         ax.set_title(f"{y_key} vs {x_key}")
-        fname = f"{y_key}_vs_{x_key}.png".replace("/", "_")
+        fname = f"{_sanitize_label(y_key)}_vs_{_sanitize_label(x_key)}.png"
         fig.savefig(os.path.join(out_dir, fname), bbox_inches="tight")
         plt.close(fig)
 
@@ -178,6 +176,12 @@ def main() -> None:
         default=80,
         help="Number of logarithmic bins for 2-D histograms.",
     )
+    parser.add_argument(
+        "--features",
+        nargs="+",
+        default=None,
+        help=f"Feature list to include (default: {', '.join(DEFAULT_FEATURES)}).",
+    )
     args = parser.parse_args()
 
     search_pattern = os.path.join(args.input_root, args.file_pattern)
@@ -187,8 +191,13 @@ def main() -> None:
     if not files:
         raise SystemExit(f"No .npz files matching {search_pattern}")
 
-    features_raw = load_features(files, SELECTED_FEATURES)
-    features = {DISPLAY_LABELS[key]: features_raw[key] for key in SELECTED_FEATURES}
+    feature_names = args.features or DEFAULT_FEATURES
+    try:
+        features_raw = load_features(files, feature_names)
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    features = {DISPLAY_LABELS.get(key, key): features_raw[key] for key in feature_names}
     os.makedirs(args.output_dir, exist_ok=True)
 
     heatmap_path = os.path.join(args.output_dir, "correlation_heatmap.png")
@@ -198,6 +207,20 @@ def main() -> None:
     hist_dir = os.path.join(args.output_dir, "pair_histograms")
     plot_pair_histograms(features, hist_dir, n_bins=args.bins)
     print(f"Wrote pair histograms to {hist_dir}")
+
+    snapshot_root = os.path.join(args.output_dir, "snapshots")
+    for file_path in files:
+        parent_name = Path(file_path).parent.name
+        snap_name = _sanitize_label(parent_name or Path(file_path).stem)
+        try:
+            snap_features_raw = load_features([file_path], feature_names)
+        except KeyError as exc:
+            print(f"[WARN] Skipping {file_path}: {exc}")
+            continue
+        snap_features = {DISPLAY_LABELS.get(key, key): snap_features_raw[key] for key in feature_names}
+        snap_dir = os.path.join(snapshot_root, snap_name, "pair_histograms")
+        plot_pair_histograms(snap_features, snap_dir, n_bins=args.bins)
+        print(f"Wrote pair histograms for {file_path} to {snap_dir}")
 
 
 if __name__ == "__main__":

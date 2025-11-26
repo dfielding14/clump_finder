@@ -16,9 +16,11 @@ The driver follows a simple but memory‑aware pipeline so we can work on Fronti
 
 5. **Metrics and statistics.** `metrics.py` reduces per‑label quantities: cell counts, volumes/masses, exposed surface area, centroids, velocity statistics, and principal axes. We ingest data as float32 to save RAM, but accumulations (weights, covariances) stay in float64 to preserve accuracy on large tiles.
 
-6. **Persistence.** Each rank writes one `.npz` plus a JSON meta file (bounding box, timings, config snapshot). An optional master step (`scripts/analysis/aggregate_results.py`) concatenates per-rank outputs and writes a global catalog.
+6. **Persistence.** Each rank writes one `.npz` plus a JSON meta file (bounding box, timings, config snapshot). A master step (`scripts/analysis/aggregate_results.py`) concatenates per-rank outputs and writes `clumps_master.npz`.
 
-7. **Visualization.** `plot_clumps.py` generates quick‑look PNGs: size histogram, size vs velocity dispersion, and a diagnostic of surface area versus volume (`area / volume^{2/3}`).
+7. **Stitching.** `stitch.py` merges per-rank catalogs into a global `clumps_stitched.npz` by unifying labels that touch across node faces (6-connectivity only). The stitched catalog preserves velocity statistics (`velocity_mean`, `velocity_std`) alongside geometric quantities.
+
+8. **Visualization.** `plot_clumps.py` generates quick-look PNGs: size spectrum (`V · dN / dlog V`), velocity dispersion diagnostics, surface-area scaling, and stitched-versus-unstitched comparison plots.
 
 Key design choices:
 
@@ -71,25 +73,21 @@ Per‑node `.npz` contains:
 Master `.npz` (`clumps_master.npz`) contains concatenated arrays plus `gid` and `rank`.
 Sidecar (optional): JSON with part list and clump count.
 
-### Stitching (global clumps)
+### Stitching workflow
 
-- `stitch.py` builds global clumps by unifying per‑rank labels that touch across node faces using a DSU.
-- Stitching is defined for and guarantees correctness under 6‑connectivity only.
-- Usage:
-  - `python stitch.py --input ./clump_out --output ./clump_out/clumps_stitched.npz`
-  - Requires per‑rank `.npz` files to include boundary face maps (auto‑exported by `clump_finder.py`).
+`stitch.py` builds global clumps by unifying per-rank labels that touch across node faces using a DSU and is defined for 6-connectivity only. After aggregating a snapshot with `scripts/analysis/aggregate_results.py`, run `python stitch.py --input <output_dir> --output <output_path>` to produce `clumps_stitched.npz`. The stitched catalog now carries forward `velocity_mean` and `velocity_std` alongside the geometric quantities. Follow up with `python scripts/analysis/plot_clumps.py --input <clumps_master.npz> --compare <clumps_stitched.npz> --compare-labels "Unstitched" "Stitched"` to generate the overlay and ratio panels, then re-run on `clumps_stitched.npz` to get the full stitched diagnostics. Frontier batch jobs wire this sequence automatically; see below for the chained 5120 campaign. Per-rank `.npz` files must include the boundary face metadata exported by `clump_finder.py`.
 
 ## Frontier (ORNL) Notes
 
-- Use one rank per node:
+- Launch one rank per node per submission:
 ```
 sbatch jobs/slurm/frontier/frontier_clump.sbatch
 ```
-- Edit the SLURM script to load your site modules or virtual env.
-- Environment hints:
-  - `OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK`
-  - `NUMBA_NUM_THREADS=$SLURM_CPUS_PER_TASK`
-  - `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `NUMEXPR_NUM_THREADS=1`
+- Adjust the SLURM templates in `jobs/slurm/frontier/` to load your preferred modules or virtual environment.
+- Set `OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK`, `NUMBA_NUM_THREADS=$SLURM_CPUS_PER_TASK`, and keep `OPENBLAS/MKL/NUMEXPR` pinned to 1 to avoid oversubscription.
+- Production configs are versioned under `configs/runs/` and use `_conn6` filenames to emphasize the enforced connectivity.
+- The 5120 debug campaign is split into five sbatch files covering steps 20–40. Kick it off with `sbatch jobs/slurm/frontier/frontier_clump_n5120_conn6_batch_20_23.sbatch`; each batch processes four snapshots, aggregates, stitches, plots, and finishes by invoking `scripts/chain_submit.sh` to submit the next batch after a short delay so only one debug job waits in the queue.
+- Outputs land in each config’s `output_dir`, keeping logs under `logs/` with the job name and SLURM ID.
 
 ## Configuration Keys (highlights)
 
@@ -107,8 +105,18 @@ sbatch jobs/slurm/frontier/frontier_clump.sbatch
 
 ## Plotting
 
-- Size histogram (log–log) and size vs velocity dispersion (log–log, LogNorm) PNGs.
-- For cell_count, size bins use integer-rounded geometric edges; for volume, log-spaced bins.
+Use `python scripts/analysis/plot_clumps.py --input <npz> --outdir <png_dir> [--compare <second_npz>]`.
+
+- `*_size_hist.png` reports `V · dN / dlog V` against `V [Δx^3]` with geometric binning.
+- `*_size_vs_vdisp.png` shows a log–log heatmap of clump size versus velocity dispersion when velocity stats are present.
+- `*_area_over_vol89_vs_volume.png` visualizes area normalized by volume^(8/9).
+- `*_velocity_std_vs_volume.png` maps velocity dispersion versus volume for stitched catalogs that retain `velocity_std`.
+- `*_size_hist_compare.png` (via `--compare`) overlays primary and secondary catalogs, adds the integrated clump volume to the legend labels, and plots the secondary/primary ratio in a second panel.
+
+**Advanced analysis**
+- Additional studies live under `scripts/analysis/`: correlation heatmaps (`analyze_correlations.py`), PCA/FA (`analyze_pca.py`), and embedding/clustering (`analyze_embedding.py`).
+- By default these tools work with the always-emitted fields (`volume`, `mass`, `area`, `cell_count`, `velocity_std`, `velocity_mean`).
+- To revisit the full thermodynamic feature set (density/pressure moments, velocity components, etc.), rerun `clump_finder.py` with `--extra-stats` or set `extra_stats: true` in the YAML config so those arrays are present in `clumps_master.npz`.
 
 ## Notes
 
