@@ -320,6 +320,24 @@ def main():
             axis_ratios[idx, :] = (b / (a + small), c / (a + small))
             orientation[idx, :, :] = vecs
 
+        # Tier 0: Derived shape metrics from existing V, S, principal axes
+        derived_metrics = M.derived_shape_metrics(vol, area, principal_axes_lengths)
+
+        # Tier 1a: Euler characteristic
+        euler_chi = M.euler_characteristic_fast(labels, K=K)
+
+        # Tier 1b: Bounding box shape metrics
+        bbox_metrics = M.bbox_shape_metrics(bbox_ijk, principal_axes_lengths)
+
+        # Tier 2: Minkowski functionals (selective, above size threshold)
+        minkowski_min_cells = int(cfg.get("minkowski_min_cells", 1000))
+        minkowski_metrics = M.compute_minkowski_functionals(
+            labels, vol, area, euler_chi,
+            dx=dx, dy=dy, dz=dz, K=K,
+            min_cells=minkowski_min_cells,
+            cell_count=cell_count
+        )
+
         presence = np.zeros((K, 6), dtype=bool)
         for idx, arr in enumerate((labels[0, :, :],
                                    labels[-1, :, :],
@@ -346,6 +364,29 @@ def main():
             "principal_axes_lengths": principal_axes_lengths,
             "axis_ratios": axis_ratios,
             "orientation": orientation,
+            # Tier 0: Derived shape metrics
+            "triaxiality": derived_metrics["triaxiality"],
+            "sphericity": derived_metrics["sphericity"],
+            "compactness": derived_metrics["compactness"],
+            "r_eff": derived_metrics["r_eff"],
+            "elongation": derived_metrics["elongation"],
+            # Tier 1a: Euler characteristic
+            "euler_characteristic": euler_chi,
+            # Tier 1b: Bounding box shape metrics
+            "bbox_lengths": bbox_metrics["bbox_lengths"],
+            "bbox_elongation": bbox_metrics["bbox_elongation"],
+            "bbox_flatness": bbox_metrics["bbox_flatness"],
+            "curvature_flag": bbox_metrics["curvature_flag"],
+            # Tier 2: Minkowski functionals and shapefinders
+            "integrated_curvature": minkowski_metrics["integrated_curvature"],
+            "thickness": minkowski_metrics["thickness"],
+            "breadth": minkowski_metrics["breadth"],
+            "length": minkowski_metrics["length"],
+            "filamentarity": minkowski_metrics["filamentarity"],
+            "planarity": minkowski_metrics["planarity"],
+            "minkowski_computed": minkowski_metrics["minkowski_computed"],
+            "minkowski_min_cells": np.int32(minkowski_min_cells),
+            # Stitching metadata
             "face_presence": presence,
             "face_pair_bits": pair_bits,
             "shell_t": np.int32(3),
