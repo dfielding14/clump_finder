@@ -364,6 +364,18 @@ def main():
             "principal_axes_lengths": principal_axes_lengths,
             "axis_ratios": axis_ratios,
             "orientation": orientation,
+            # Raw covariance tensor sums (for proper stitching)
+            # These can be combined across ranks to recompute shape metrics
+            "cov_W": W,      # total mass (weight)
+            "cov_Sx": Sx,    # first moment x
+            "cov_Sy": Sy,    # first moment y
+            "cov_Sz": Sz,    # first moment z
+            "cov_Sxx": Sxx,  # second moment xx
+            "cov_Syy": Syy,  # second moment yy
+            "cov_Szz": Szz,  # second moment zz
+            "cov_Sxy": Sxy,  # second moment xy
+            "cov_Sxz": Sxz,  # second moment xz
+            "cov_Syz": Syz,  # second moment yz
             # Tier 0: Derived shape metrics
             "triaxiality": derived_metrics["triaxiality"],
             "sphericity": derived_metrics["sphericity"],
