@@ -424,44 +424,35 @@ def euler_characteristic(labels: np.ndarray, K: int | None = None) -> np.ndarray
     padded = np.zeros((ni + 1, nj + 1, nk + 1), dtype=labels.dtype)
     padded[:ni, :nj, :nk] = labels
 
-    # Process all 2×2×2 octants
-    for di in range(2):
-        for dj in range(2):
-            for dk in range(2):
-                # Get the 8 corners of each octant
-                c000 = padded[:-1, :-1, :-1]
-                c100 = padded[1:, :-1, :-1]
-                c010 = padded[:-1, 1:, :-1]
-                c110 = padded[1:, 1:, :-1]
-                c001 = padded[:-1, :-1, 1:]
-                c101 = padded[1:, :-1, 1:]
-                c011 = padded[:-1, 1:, 1:]
-                c111 = padded[1:, 1:, 1:]
+    # Get the 8 corners of the 2×2×2 sliding window (vectorized over whole grid)
+    c000 = padded[:-1, :-1, :-1]
+    c100 = padded[1:, :-1, :-1]
+    c010 = padded[:-1, 1:, :-1]
+    c110 = padded[1:, 1:, :-1]
+    c001 = padded[:-1, :-1, 1:]
+    c101 = padded[1:, :-1, 1:]
+    c011 = padded[:-1, 1:, 1:]
+    c111 = padded[1:, 1:, 1:]
 
-                # For each label, compute octant configuration and accumulate
-                # We iterate over octants where at least one voxel is non-zero
-                for lab in range(1, K + 1):
-                    # Binary mask for this label at each corner
-                    b000 = (c000 == lab).astype(np.uint8)
-                    b100 = (c100 == lab).astype(np.uint8)
-                    b010 = (c010 == lab).astype(np.uint8)
-                    b110 = (c110 == lab).astype(np.uint8)
-                    b001 = (c001 == lab).astype(np.uint8)
-                    b101 = (c101 == lab).astype(np.uint8)
-                    b011 = (c011 == lab).astype(np.uint8)
-                    b111 = (c111 == lab).astype(np.uint8)
+    # NOTE: This loop over K is slow for large K.
+    # For high performance with many labels, use euler_characteristic_lut (Numba) instead.
+    for lab in range(1, K + 1):
+        # Binary mask for this label at each corner
+        b000 = (c000 == lab).astype(np.uint8)
+        b100 = (c100 == lab).astype(np.uint8)
+        b010 = (c010 == lab).astype(np.uint8)
+        b110 = (c110 == lab).astype(np.uint8)
+        b001 = (c001 == lab).astype(np.uint8)
+        b101 = (c101 == lab).astype(np.uint8)
+        b011 = (c011 == lab).astype(np.uint8)
+        b111 = (c111 == lab).astype(np.uint8)
 
-                    # Compute octant index (8-bit)
-                    idx = (b000 + 2 * b100 + 4 * b010 + 8 * b110 +
-                           16 * b001 + 32 * b101 + 64 * b011 + 128 * b111)
+        # Compute octant index (8-bit)
+        idx = (b000 + 2 * b100 + 4 * b010 + 8 * b110 +
+               16 * b001 + 32 * b101 + 64 * b011 + 128 * b111)
 
-                    # Sum Euler contributions
-                    chi[lab] += euler_lut[idx].sum()
-
-                # Only need one pass through the octants
-                break
-            break
-        break
+        # Sum Euler contributions
+        chi[lab] += euler_lut[idx].sum()
 
     return chi[1:]
 
@@ -1586,31 +1577,41 @@ def minkowski_shapefinders(volume: np.ndarray,
                             area: np.ndarray,
                             curvature: np.ndarray,
                             euler_chi: np.ndarray) -> dict[str, np.ndarray]:
-    """Compute Minkowski shapefinders from the four Minkowski functionals.
+    """Compute Sahni et al. (1998) Shapefinders from Minkowski functionals.
 
-    The shapefinders (T, B, L) characterize the thickness, breadth, and length
-    of an object in a way that is robust to curvature. From these, we derive
-    filamentarity F and planarity P.
+    The shapefinders (T, B, L) are dimensional quantities that characterize
+    the physical size of an object along its three principal dimensions.
+    For a sphere of radius r, all three equal r.
+
+    Physical Dimensions (units of length):
+        T (Thickness) = 3V / S     - smallest dimension
+        B (Breadth)   = S / C      - intermediate dimension
+        L (Length)    = C / (4π)   - largest dimension
+
+    Shape Ratios (dimensionless, range 0 to 1):
+        P (Planarity)     = (B - T) / (B + T)  - 0 for sphere, 1 for pancake
+        F (Filamentarity) = (L - B) / (L + B)  - 0 for sphere, 1 for filament
 
     Parameters
     ----------
     volume : (K,) array
-        Minkowski functional W0 = volume.
+        Volume of each clump.
     area : (K,) array
-        Minkowski functional W1 = surface area / 3.
+        Surface area of each clump.
     curvature : (K,) array
-        Minkowski functional W2 = integrated mean curvature / 3.
+        Integrated mean curvature of each clump.
     euler_chi : (K,) array
-        Minkowski functional W3 = Euler characteristic.
+        Euler characteristic (kept for compatibility, not used in formulas).
 
     Returns
     -------
-    dict with keys:
-        thickness : (K,) - T = W0 / W1 (characteristic thickness)
-        breadth : (K,) - B = W1 / W2 (characteristic breadth)
-        length : (K,) - L = W2 / W3 (characteristic length)
-        filamentarity : (K,) - F = (B - T) / (B + T), 0 for sphere, 1 for filament
-        planarity : (K,) - P = (L - B) / (L + B), 0 for sphere, 1 for sheet
+    dict with keys: thickness, breadth, length, planarity, filamentarity
+
+    References
+    ----------
+    Sahni, V., Sathyaprakash, B.S., & Shandarin, S.F. (1998).
+    "Shapefinders: A new shape diagnostic for large-scale structure"
+    ApJ 495, L5-L8.
     """
     K = volume.shape[0]
     if K == 0:
@@ -1623,37 +1624,40 @@ def minkowski_shapefinders(volume: np.ndarray,
             "planarity": empty,
         }
 
-    eps = 1e-10  # Numerical stability epsilon
+    eps = 1e-12  # Numerical stability epsilon
 
-    # Convert to Minkowski functional convention
-    # W0 = V, W1 = S/3, W2 = C/3, W3 = χ
-    W0 = volume.astype(np.float64, copy=False)
-    W1 = area.astype(np.float64, copy=False) / 3.0
-    W2 = curvature.astype(np.float64, copy=False) / 3.0
-    W3 = euler_chi.astype(np.float64, copy=False)
+    # Cast inputs to float64
+    V = volume.astype(np.float64, copy=False)
+    S = area.astype(np.float64, copy=False)
+    C = curvature.astype(np.float64, copy=False)
 
-    # Shapefinders
-    # T = W0 / W1 (thickness: volume per unit area)
-    thickness = W0 / (W1 + eps)
+    # Dimensional Shapefinders
+    # For a sphere of radius r: T = B = L = r
 
-    # B = W1 / W2 (breadth: area per unit curvature)
-    breadth = W1 / (np.abs(W2) + eps)
+    # Thickness T = 3V/S
+    # Sphere check: 3 * (4/3 π r³) / (4 π r²) = r ✓
+    thickness = (3.0 * V) / (S + eps)
 
-    # L = W2 / W3 (length: curvature per Euler number)
-    # Use abs to handle negative curvature
-    # Note: When |χ| < 0.5, the shapefinder is ill-defined (toroidal topology)
-    length = np.abs(W2) / (np.abs(W3) + eps)
-    # Set NaN for objects with |χ| < 0.5 (Euler near 0 means toroidal/complex topology)
-    length = np.where(np.abs(W3) < 0.5, np.nan, length)
+    # Breadth B = S/C
+    # Sphere check: (4 π r²) / (4 π r) = r ✓
+    # Use abs(C) because mean curvature can be negative for concave surfaces
+    breadth = S / (np.abs(C) + eps)
 
-    # Filamentarity: F = (B - T) / (B + T)
-    # F = 0 for a sphere (B = T), F → 1 for a thin filament (B >> T)
-    filamentarity = (breadth - thickness) / (breadth + thickness + eps)
+    # Length L = C / (4π)
+    # Sphere check: (4 π r) / (4 π) = r ✓
+    # NOTE: This is the correct Sahni formula. Previously was C/χ which
+    # blows up for toroidal topologies (χ ≈ 0).
+    length = np.abs(C) / (4.0 * np.pi)
 
-    # Planarity: P = (L - B) / (L + B)
-    # P = 0 for a sphere (L = B), P → 1 for a thin sheet (L >> B)
-    # When length is NaN, planarity is also NaN
-    planarity = (length - breadth) / (length + breadth + eps)
+    # Dimensionless Shape Metrics
+
+    # Planarity P = (B - T) / (B + T)
+    # P = 0 for sphere (B = T), P → 1 for pancake/sheet (B >> T)
+    planarity = (breadth - thickness) / (breadth + thickness + eps)
+
+    # Filamentarity F = (L - B) / (L + B)
+    # F = 0 for sphere (L = B), F → 1 for filament (L >> B)
+    filamentarity = (length - breadth) / (length + breadth + eps)
 
     return {
         "thickness": thickness,
