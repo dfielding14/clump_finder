@@ -1193,19 +1193,26 @@ try:
                                 if 0 <= ii < ni and 0 <= jj < nj and 0 <= kk < nk:
                                     corners[di + 2 * dj + 4 * dk] = labels[ii, jj, kk]
 
-                    # Find unique labels in this cube (excluding background)
-                    # Use a simple approach since numba doesn't support sets well
-                    seen = np.zeros(K + 1, dtype=np.uint8)
+                    # Collect unique labels in this cube (max 8, typically 1-2)
+                    # This avoids iterating over all K labels per cube
+                    unique_labels = np.zeros(8, dtype=np.int64)
+                    n_unique = 0
                     for b in range(8):
                         lbl = corners[b]
                         if lbl > 0 and lbl <= K:
-                            seen[lbl] = 1
+                            # Check if already seen
+                            found = False
+                            for u in range(n_unique):
+                                if unique_labels[u] == lbl:
+                                    found = True
+                                    break
+                            if not found:
+                                unique_labels[n_unique] = lbl
+                                n_unique += 1
 
                     # For each label present, compute its configuration and accumulate
-                    for lbl in range(1, K + 1):
-                        if seen[lbl] == 0:
-                            continue
-
+                    for u in range(n_unique):
+                        lbl = unique_labels[u]
                         config = 0
                         for b in range(8):
                             if corners[b] == lbl:
