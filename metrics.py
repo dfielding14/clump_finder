@@ -1623,7 +1623,7 @@ def minkowski_shapefinders(volume: np.ndarray,
             "planarity": empty,
         }
 
-    eps = 1e-30
+    eps = 1e-10  # Numerical stability epsilon
 
     # Convert to Minkowski functional convention
     # W0 = V, W1 = S/3, W2 = C/3, W3 = χ
@@ -1641,7 +1641,10 @@ def minkowski_shapefinders(volume: np.ndarray,
 
     # L = W2 / W3 (length: curvature per Euler number)
     # Use abs to handle negative curvature
+    # Note: When |χ| < 0.5, the shapefinder is ill-defined (toroidal topology)
     length = np.abs(W2) / (np.abs(W3) + eps)
+    # Set NaN for objects with |χ| < 0.5 (Euler near 0 means toroidal/complex topology)
+    length = np.where(np.abs(W3) < 0.5, np.nan, length)
 
     # Filamentarity: F = (B - T) / (B + T)
     # F = 0 for a sphere (B = T), F → 1 for a thin filament (B >> T)
@@ -1649,6 +1652,7 @@ def minkowski_shapefinders(volume: np.ndarray,
 
     # Planarity: P = (L - B) / (L + B)
     # P = 0 for a sphere (L = B), P → 1 for a thin sheet (L >> B)
+    # When length is NaN, planarity is also NaN
     planarity = (length - breadth) / (length + breadth + eps)
 
     return {
