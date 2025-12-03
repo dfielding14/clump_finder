@@ -436,7 +436,17 @@ def stitch_reduce(input_dir: str, output_path: str):
                               [Cxy[i], Cyy[i], Cyz[i]],
                               [Cxz[i], Cyz[i], Czz[i]]], dtype=np.float64)
                 C = (C + C.T) * 0.5  # ensure symmetry
-                vals, vecs = np.linalg.eigh(C)
+                # Skip eigendecomposition if covariance has inf/nan (overflow)
+                if not np.all(np.isfinite(C)):
+                    principal_axes_lengths[i] = (np.nan, np.nan, np.nan)
+                    axis_ratios[i] = (np.nan, np.nan)
+                    continue
+                try:
+                    vals, vecs = np.linalg.eigh(C)
+                except np.linalg.LinAlgError:
+                    principal_axes_lengths[i] = (np.nan, np.nan, np.nan)
+                    axis_ratios[i] = (np.nan, np.nan)
+                    continue
                 order = np.argsort(vals)[::-1]
                 vals = vals[order]
                 vecs = vecs[:, order]
@@ -477,112 +487,17 @@ def stitch_reduce(input_dir: str, output_path: str):
         out["triaxiality"] = triaxiality
         out["elongation"] = elongation
 
-        # Minkowski shapefinders (from V, S, C)
-        C_integrated = euler_chi * 4.0 * np.pi  # Approximate
-        thickness = volume / (area + small)
-        breadth = area / (C_integrated + small)
-        length_mink = C_integrated / (4.0 * np.pi)
+        # Minkowski shapefinders REMOVED
+        # The approximation C_integrated = euler_chi * 4*pi doesn't work for computing
+        # proper shapefinders (breadth, length, planarity, filamentarity).
+        # Euler characteristic is kept for reference but integrated curvature
+        # requires voxel-level boundary information not preserved through stitching.
 
-        out["integrated_curvature"] = C_integrated
-        out["thickness"] = thickness
-        out["breadth"] = breadth
-        out["length"] = length_mink
-
-        # Shapefinders
-        T1 = thickness
-        T2 = breadth
-        T3 = length_mink
-        planarity = (T2 - T1) / (T2 + T1 + small)
-        filamentarity = (T3 - T2) / (T3 + T2 + small)
-        out["planarity"] = planarity
-        out["filamentarity"] = filamentarity
-
-    # Prepare output paths
+    # Write everything to single output file
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    base_path = output_path.replace('.npz', '')
-    if base_path == output_path:
-        base_path = output_path  # no .npz extension
+    np.savez(output_path, **out)
 
-    # 1. Primary output: basic clump properties
-    primary_out = {
-        "gid": np.array(uniq_roots, dtype=np.uint64),
-        "cell_count": cell_count,
-        "volume": volume,
-        "mass": mass,
-        "area": area,
-        "centroid_vol": centroid_vol,
-        "centroid_mass": centroid_mass,
-        "velocity_mean": speed_mean,
-        "velocity_std": speed_std,
-        "bbox_ijk": bbox.astype(np.int32),
-        "voxel_spacing": np.array([dx, dy, dz], dtype=np.float64),
-        "connectivity": np.int32(6),
-        "is_stitched": is_stitched,
-        "n_fragments": stitched_count,
-    }
-    np.savez(output_path, **primary_out)
-
-    # Additional files only if extra stats available
-    if has_extra_stats:
-        # 2. Thermodynamic moments
-        thermo_out = {"gid": np.array(uniq_roots, dtype=np.uint64)}
-        for comp in ["vx", "vy", "vz"]:
-            mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, comp, "volume")
-            if mu is not None:
-                thermo_out[f"{comp}_mean"] = mu
-                thermo_out[f"{comp}_std"] = sigma
-        for stat in ["rho", "T", "pressure"]:
-            mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, stat, "volume")
-            if mu is not None:
-                thermo_out[f"{stat}_mean"] = mu
-                thermo_out[f"{stat}_std"] = sigma
-        for stat in ["rho", "T", "vx", "vy", "vz", "pressure"]:
-            mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, f"{stat}_massw", "mass")
-            if mu is not None:
-                thermo_out[f"{stat}_mean_massw"] = mu
-                thermo_out[f"{stat}_std_massw"] = sigma
-        np.savez(f"{base_path}_thermo.npz", **thermo_out)
-
-        # 3. Shape metrics
-        shape_out = {
-            "gid": np.array(uniq_roots, dtype=np.uint64),
-            "principal_axes_lengths": principal_axes_lengths,
-            "axis_ratios": axis_ratios,
-            "shape_metrics_valid": out["shape_metrics_valid"],
-            "r_eff": r_eff,
-            "sphericity": sphericity,
-            "compactness": compactness,
-            "triaxiality": triaxiality,
-            "elongation": elongation,
-            "euler_characteristic": euler_chi,
-            "integrated_curvature": C_integrated,
-            "thickness": thickness,
-            "breadth": breadth,
-            "length": length_mink,
-            "planarity": planarity,
-            "filamentarity": filamentarity,
-        }
-        if has_full_cov:
-            shape_out["orientation"] = orientation
-        np.savez(f"{base_path}_shape.npz", **shape_out)
-
-        # 4. Raw moment sums (for potential reanalysis)
-        moments_out = {
-            "gid": np.array(uniq_roots, dtype=np.uint64),
-            "cov_W": cov_W,
-            "cov_Sx": cov_Sx,
-            "cov_Sy": cov_Sy,
-            "cov_Sz": cov_Sz,
-            "cov_Sxx": cov_Sxx,
-            "cov_Syy": cov_Syy,
-            "cov_Szz": cov_Szz,
-            "cov_Sxy": cov_Sxy,
-            "cov_Sxz": cov_Sxz,
-            "cov_Syz": cov_Syz,
-        }
-        np.savez(f"{base_path}_moments.npz", **moments_out)
-
-    return primary_out
+    return out
 
 
 def main():

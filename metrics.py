@@ -505,71 +505,7 @@ def euler_characteristic_fast(labels: np.ndarray, K: int | None = None) -> np.nd
     # χ = 1 - (number of handles/tunnels)
     # For voxelized objects, we can compute this from local 2×2×2 configurations
 
-    chi = np.zeros(K + 1, dtype=np.float64)
-
-    # Pad with zeros
-    pad = np.zeros((ni + 2, nj + 2, nk + 2), dtype=labels.dtype)
-    pad[1:-1, 1:-1, 1:-1] = labels
-
-    # Count vertices (voxel corners where label changes)
-    # A vertex is shared by up to 8 voxels; count unique boundary vertices per label
-    # Count edges (voxel edges where label changes)
-    # Count faces (already computed as exposed_area conceptually)
-
-    # Use the discrete Euler formula based on 2×2×2 cubes
-    # For efficiency, vectorize over all cubes
-
-    # Get all 8 corners of 2×2×2 cubes
-    c = np.zeros((ni + 1, nj + 1, nk + 1, 8), dtype=labels.dtype)
-    c[:, :, :, 0] = pad[:-1, :-1, :-1]
-    c[:, :, :, 1] = pad[1:, :-1, :-1]
-    c[:, :, :, 2] = pad[:-1, 1:, :-1]
-    c[:, :, :, 3] = pad[1:, 1:, :-1]
-    c[:, :, :, 4] = pad[:-1, :-1, 1:]
-    c[:, :, :, 5] = pad[1:, :-1, 1:]
-    c[:, :, :, 6] = pad[:-1, 1:, 1:]
-    c[:, :, :, 7] = pad[1:, 1:, 1:]
-
-    # For each cube, compute contribution to Euler characteristic
-    # Contribution depends on the configuration of labels in the cube
-    # For a single label, use the standard octant LUT
-
-    # Simplified: count cubes where exactly 1,2,3,...,8 corners have label l
-    # and weight by Euler contribution
-
-    # Euler contributions for n corners of same label in a 2×2×2 cube:
-    # These are derived from the discrete Euler formula
-    # n=0: 0, n=1: 1, n=2: depends on adjacency, etc.
-    # For connected configurations:
-    # n=1: +1 (isolated vertex contributes +1)
-    # n=8: +1 (full cube contributes +1)
-    # etc.
-
-    # More accurate: iterate per label
-    for lab in range(1, K + 1):
-        mask = (c == lab)  # (ni+1, nj+1, nk+1, 8) bool
-        n_corners = mask.sum(axis=3)  # number of corners with this label per cube
-
-        # Only cubes with at least one corner contribute
-        active = n_corners > 0
-
-        # For each active cube, the Euler contribution is:
-        # +1 if odd number of corners, 0 if even (simplified binary counting)
-        # This is the standard formula for the discrete Euler char
-        # χ = sum over all cubes of (-1)^(n_corners + 1) when n_corners > 0
-
-        # Actually use: contribution = 1 - n_corners/4 + n_corners*(n_corners-1)/24 for isolated
-        # Simpler: just count and use standard formula
-        # The exact formula depends on connectivity
-
-        # Use additive Euler formula: each foreground voxel contributes +1,
-        # each shared face subtracts, each shared edge adds, each shared vertex subtracts
-        # This equals the alternating sum of k-cells
-
-        # Simplest correct approach: count by voxel and subtract shared faces/edges/vertices
-        pass
-
-    # Fall back to simpler per-voxel counting
+    # Compute Euler characteristic using voxel counting with inclusion-exclusion
     # Number of voxels per label
     n_voxels = np.bincount(labels.ravel(), minlength=K + 1).astype(np.float64)
 
@@ -811,6 +747,367 @@ try:
     import numba
 
     @numba.njit(parallel=True, cache=True)
+    def _covariance_tensor_numba(labels: np.ndarray, dens: np.ndarray,
+                                   xi: np.ndarray, yj: np.ndarray, zk: np.ndarray,
+                                   Vc: float, K: int) -> tuple:
+        """Numba-accelerated covariance tensor accumulation.
+
+        Computes first and second moments for shape diagnostics in O(N) time
+        using parallel iteration over voxels.
+
+        Returns
+        -------
+        W, Sx, Sy, Sz, Sxx, Syy, Szz, Sxy, Sxz, Syz : (K+1,) arrays
+        """
+        ni, nj, nk = labels.shape
+
+        # Initialize accumulators
+        W = np.zeros(K + 1, dtype=np.float64)
+        Sx = np.zeros(K + 1, dtype=np.float64)
+        Sy = np.zeros(K + 1, dtype=np.float64)
+        Sz = np.zeros(K + 1, dtype=np.float64)
+        Sxx = np.zeros(K + 1, dtype=np.float64)
+        Syy = np.zeros(K + 1, dtype=np.float64)
+        Szz = np.zeros(K + 1, dtype=np.float64)
+        Sxy = np.zeros(K + 1, dtype=np.float64)
+        Sxz = np.zeros(K + 1, dtype=np.float64)
+        Syz = np.zeros(K + 1, dtype=np.float64)
+
+        # Process in parallel over i-slices
+        for i in numba.prange(ni):
+            # Thread-local accumulators
+            W_local = np.zeros(K + 1, dtype=np.float64)
+            Sx_local = np.zeros(K + 1, dtype=np.float64)
+            Sy_local = np.zeros(K + 1, dtype=np.float64)
+            Sz_local = np.zeros(K + 1, dtype=np.float64)
+            Sxx_local = np.zeros(K + 1, dtype=np.float64)
+            Syy_local = np.zeros(K + 1, dtype=np.float64)
+            Szz_local = np.zeros(K + 1, dtype=np.float64)
+            Sxy_local = np.zeros(K + 1, dtype=np.float64)
+            Sxz_local = np.zeros(K + 1, dtype=np.float64)
+            Syz_local = np.zeros(K + 1, dtype=np.float64)
+
+            x = xi[i]
+            for j in range(nj):
+                y = yj[j]
+                for k in range(nk):
+                    lbl = labels[i, j, k]
+                    if lbl == 0:
+                        continue
+                    z = zk[k]
+                    w = dens[i, j, k] * Vc
+
+                    W_local[lbl] += w
+                    Sx_local[lbl] += w * x
+                    Sy_local[lbl] += w * y
+                    Sz_local[lbl] += w * z
+                    Sxx_local[lbl] += w * x * x
+                    Syy_local[lbl] += w * y * y
+                    Szz_local[lbl] += w * z * z
+                    Sxy_local[lbl] += w * x * y
+                    Sxz_local[lbl] += w * x * z
+                    Syz_local[lbl] += w * y * z
+
+            # Accumulate thread-local results
+            for lbl in range(K + 1):
+                W[lbl] += W_local[lbl]
+                Sx[lbl] += Sx_local[lbl]
+                Sy[lbl] += Sy_local[lbl]
+                Sz[lbl] += Sz_local[lbl]
+                Sxx[lbl] += Sxx_local[lbl]
+                Syy[lbl] += Syy_local[lbl]
+                Szz[lbl] += Szz_local[lbl]
+                Sxy[lbl] += Sxy_local[lbl]
+                Sxz[lbl] += Sxz_local[lbl]
+                Syz[lbl] += Syz_local[lbl]
+
+        return W, Sx, Sy, Sz, Sxx, Syy, Szz, Sxy, Sxz, Syz
+
+    @numba.njit(parallel=True, cache=True)
+    def _thermo_moments_numba(labels: np.ndarray,
+                               rho: np.ndarray, T: np.ndarray,
+                               vx: np.ndarray, vy: np.ndarray, vz: np.ndarray,
+                               P: np.ndarray,
+                               w_vol: np.ndarray, w_mass: np.ndarray,
+                               K: int) -> tuple:
+        """Compute moments (W, S1, S2, S3, S4) for 6 fields × 2 weights in one pass.
+
+        Returns 60 arrays: for each of 6 fields × 2 weights, we get (W, S1, S2, S3, S4).
+        The ordering is: rho_vol, rho_mass, T_vol, T_mass, vx_vol, vx_mass, ...
+        """
+        ni, nj, nk = labels.shape
+
+        # 6 fields × 2 weights × 5 moments = 60 accumulators
+        # But we can share W arrays since they only depend on weights
+        W_vol = np.zeros(K + 1, dtype=np.float64)
+        W_mass = np.zeros(K + 1, dtype=np.float64)
+
+        # S1 (first moment = weighted sum)
+        S1_rho_vol = np.zeros(K + 1, dtype=np.float64)
+        S1_rho_mass = np.zeros(K + 1, dtype=np.float64)
+        S1_T_vol = np.zeros(K + 1, dtype=np.float64)
+        S1_T_mass = np.zeros(K + 1, dtype=np.float64)
+        S1_vx_vol = np.zeros(K + 1, dtype=np.float64)
+        S1_vx_mass = np.zeros(K + 1, dtype=np.float64)
+        S1_vy_vol = np.zeros(K + 1, dtype=np.float64)
+        S1_vy_mass = np.zeros(K + 1, dtype=np.float64)
+        S1_vz_vol = np.zeros(K + 1, dtype=np.float64)
+        S1_vz_mass = np.zeros(K + 1, dtype=np.float64)
+        S1_P_vol = np.zeros(K + 1, dtype=np.float64)
+        S1_P_mass = np.zeros(K + 1, dtype=np.float64)
+
+        # S2 (second moment = weighted sum of squares)
+        S2_rho_vol = np.zeros(K + 1, dtype=np.float64)
+        S2_rho_mass = np.zeros(K + 1, dtype=np.float64)
+        S2_T_vol = np.zeros(K + 1, dtype=np.float64)
+        S2_T_mass = np.zeros(K + 1, dtype=np.float64)
+        S2_vx_vol = np.zeros(K + 1, dtype=np.float64)
+        S2_vx_mass = np.zeros(K + 1, dtype=np.float64)
+        S2_vy_vol = np.zeros(K + 1, dtype=np.float64)
+        S2_vy_mass = np.zeros(K + 1, dtype=np.float64)
+        S2_vz_vol = np.zeros(K + 1, dtype=np.float64)
+        S2_vz_mass = np.zeros(K + 1, dtype=np.float64)
+        S2_P_vol = np.zeros(K + 1, dtype=np.float64)
+        S2_P_mass = np.zeros(K + 1, dtype=np.float64)
+
+        # S3 (third moment)
+        S3_rho_vol = np.zeros(K + 1, dtype=np.float64)
+        S3_rho_mass = np.zeros(K + 1, dtype=np.float64)
+        S3_T_vol = np.zeros(K + 1, dtype=np.float64)
+        S3_T_mass = np.zeros(K + 1, dtype=np.float64)
+        S3_vx_vol = np.zeros(K + 1, dtype=np.float64)
+        S3_vx_mass = np.zeros(K + 1, dtype=np.float64)
+        S3_vy_vol = np.zeros(K + 1, dtype=np.float64)
+        S3_vy_mass = np.zeros(K + 1, dtype=np.float64)
+        S3_vz_vol = np.zeros(K + 1, dtype=np.float64)
+        S3_vz_mass = np.zeros(K + 1, dtype=np.float64)
+        S3_P_vol = np.zeros(K + 1, dtype=np.float64)
+        S3_P_mass = np.zeros(K + 1, dtype=np.float64)
+
+        # S4 (fourth moment)
+        S4_rho_vol = np.zeros(K + 1, dtype=np.float64)
+        S4_rho_mass = np.zeros(K + 1, dtype=np.float64)
+        S4_T_vol = np.zeros(K + 1, dtype=np.float64)
+        S4_T_mass = np.zeros(K + 1, dtype=np.float64)
+        S4_vx_vol = np.zeros(K + 1, dtype=np.float64)
+        S4_vx_mass = np.zeros(K + 1, dtype=np.float64)
+        S4_vy_vol = np.zeros(K + 1, dtype=np.float64)
+        S4_vy_mass = np.zeros(K + 1, dtype=np.float64)
+        S4_vz_vol = np.zeros(K + 1, dtype=np.float64)
+        S4_vz_mass = np.zeros(K + 1, dtype=np.float64)
+        S4_P_vol = np.zeros(K + 1, dtype=np.float64)
+        S4_P_mass = np.zeros(K + 1, dtype=np.float64)
+
+        for i in numba.prange(ni):
+            # Thread-local accumulators (to avoid race conditions)
+            W_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            W_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_rho_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_rho_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_T_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_T_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_vx_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_vx_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_vy_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_vy_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_vz_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_vz_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_P_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S1_P_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_rho_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_rho_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_T_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_T_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_vx_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_vx_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_vy_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_vy_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_vz_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_vz_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_P_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S2_P_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_rho_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_rho_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_T_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_T_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_vx_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_vx_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_vy_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_vy_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_vz_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_vz_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_P_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S3_P_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_rho_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_rho_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_T_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_T_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_vx_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_vx_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_vy_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_vy_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_vz_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_vz_mass_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_P_vol_loc = np.zeros(K + 1, dtype=np.float64)
+            S4_P_mass_loc = np.zeros(K + 1, dtype=np.float64)
+
+            for j in range(nj):
+                for k in range(nk):
+                    lbl = labels[i, j, k]
+                    if lbl == 0:
+                        continue
+                    wv = w_vol[i, j, k]
+                    wm = w_mass[i, j, k]
+                    r = rho[i, j, k]
+                    t = T[i, j, k]
+                    x = vx[i, j, k]
+                    y = vy[i, j, k]
+                    z = vz[i, j, k]
+                    p = P[i, j, k]
+
+                    W_vol_loc[lbl] += wv
+                    W_mass_loc[lbl] += wm
+
+                    # rho
+                    S1_rho_vol_loc[lbl] += wv * r
+                    S1_rho_mass_loc[lbl] += wm * r
+                    r2 = r * r
+                    S2_rho_vol_loc[lbl] += wv * r2
+                    S2_rho_mass_loc[lbl] += wm * r2
+                    r3 = r2 * r
+                    S3_rho_vol_loc[lbl] += wv * r3
+                    S3_rho_mass_loc[lbl] += wm * r3
+                    S4_rho_vol_loc[lbl] += wv * r3 * r
+                    S4_rho_mass_loc[lbl] += wm * r3 * r
+
+                    # T
+                    S1_T_vol_loc[lbl] += wv * t
+                    S1_T_mass_loc[lbl] += wm * t
+                    t2 = t * t
+                    S2_T_vol_loc[lbl] += wv * t2
+                    S2_T_mass_loc[lbl] += wm * t2
+                    t3 = t2 * t
+                    S3_T_vol_loc[lbl] += wv * t3
+                    S3_T_mass_loc[lbl] += wm * t3
+                    S4_T_vol_loc[lbl] += wv * t3 * t
+                    S4_T_mass_loc[lbl] += wm * t3 * t
+
+                    # vx
+                    S1_vx_vol_loc[lbl] += wv * x
+                    S1_vx_mass_loc[lbl] += wm * x
+                    x2 = x * x
+                    S2_vx_vol_loc[lbl] += wv * x2
+                    S2_vx_mass_loc[lbl] += wm * x2
+                    x3 = x2 * x
+                    S3_vx_vol_loc[lbl] += wv * x3
+                    S3_vx_mass_loc[lbl] += wm * x3
+                    S4_vx_vol_loc[lbl] += wv * x3 * x
+                    S4_vx_mass_loc[lbl] += wm * x3 * x
+
+                    # vy
+                    S1_vy_vol_loc[lbl] += wv * y
+                    S1_vy_mass_loc[lbl] += wm * y
+                    y2 = y * y
+                    S2_vy_vol_loc[lbl] += wv * y2
+                    S2_vy_mass_loc[lbl] += wm * y2
+                    y3 = y2 * y
+                    S3_vy_vol_loc[lbl] += wv * y3
+                    S3_vy_mass_loc[lbl] += wm * y3
+                    S4_vy_vol_loc[lbl] += wv * y3 * y
+                    S4_vy_mass_loc[lbl] += wm * y3 * y
+
+                    # vz
+                    S1_vz_vol_loc[lbl] += wv * z
+                    S1_vz_mass_loc[lbl] += wm * z
+                    z2 = z * z
+                    S2_vz_vol_loc[lbl] += wv * z2
+                    S2_vz_mass_loc[lbl] += wm * z2
+                    z3 = z2 * z
+                    S3_vz_vol_loc[lbl] += wv * z3
+                    S3_vz_mass_loc[lbl] += wm * z3
+                    S4_vz_vol_loc[lbl] += wv * z3 * z
+                    S4_vz_mass_loc[lbl] += wm * z3 * z
+
+                    # P
+                    S1_P_vol_loc[lbl] += wv * p
+                    S1_P_mass_loc[lbl] += wm * p
+                    p2 = p * p
+                    S2_P_vol_loc[lbl] += wv * p2
+                    S2_P_mass_loc[lbl] += wm * p2
+                    p3 = p2 * p
+                    S3_P_vol_loc[lbl] += wv * p3
+                    S3_P_mass_loc[lbl] += wm * p3
+                    S4_P_vol_loc[lbl] += wv * p3 * p
+                    S4_P_mass_loc[lbl] += wm * p3 * p
+
+            # Accumulate thread-local results
+            for lbl in range(K + 1):
+                W_vol[lbl] += W_vol_loc[lbl]
+                W_mass[lbl] += W_mass_loc[lbl]
+                S1_rho_vol[lbl] += S1_rho_vol_loc[lbl]
+                S1_rho_mass[lbl] += S1_rho_mass_loc[lbl]
+                S1_T_vol[lbl] += S1_T_vol_loc[lbl]
+                S1_T_mass[lbl] += S1_T_mass_loc[lbl]
+                S1_vx_vol[lbl] += S1_vx_vol_loc[lbl]
+                S1_vx_mass[lbl] += S1_vx_mass_loc[lbl]
+                S1_vy_vol[lbl] += S1_vy_vol_loc[lbl]
+                S1_vy_mass[lbl] += S1_vy_mass_loc[lbl]
+                S1_vz_vol[lbl] += S1_vz_vol_loc[lbl]
+                S1_vz_mass[lbl] += S1_vz_mass_loc[lbl]
+                S1_P_vol[lbl] += S1_P_vol_loc[lbl]
+                S1_P_mass[lbl] += S1_P_mass_loc[lbl]
+                S2_rho_vol[lbl] += S2_rho_vol_loc[lbl]
+                S2_rho_mass[lbl] += S2_rho_mass_loc[lbl]
+                S2_T_vol[lbl] += S2_T_vol_loc[lbl]
+                S2_T_mass[lbl] += S2_T_mass_loc[lbl]
+                S2_vx_vol[lbl] += S2_vx_vol_loc[lbl]
+                S2_vx_mass[lbl] += S2_vx_mass_loc[lbl]
+                S2_vy_vol[lbl] += S2_vy_vol_loc[lbl]
+                S2_vy_mass[lbl] += S2_vy_mass_loc[lbl]
+                S2_vz_vol[lbl] += S2_vz_vol_loc[lbl]
+                S2_vz_mass[lbl] += S2_vz_mass_loc[lbl]
+                S2_P_vol[lbl] += S2_P_vol_loc[lbl]
+                S2_P_mass[lbl] += S2_P_mass_loc[lbl]
+                S3_rho_vol[lbl] += S3_rho_vol_loc[lbl]
+                S3_rho_mass[lbl] += S3_rho_mass_loc[lbl]
+                S3_T_vol[lbl] += S3_T_vol_loc[lbl]
+                S3_T_mass[lbl] += S3_T_mass_loc[lbl]
+                S3_vx_vol[lbl] += S3_vx_vol_loc[lbl]
+                S3_vx_mass[lbl] += S3_vx_mass_loc[lbl]
+                S3_vy_vol[lbl] += S3_vy_vol_loc[lbl]
+                S3_vy_mass[lbl] += S3_vy_mass_loc[lbl]
+                S3_vz_vol[lbl] += S3_vz_vol_loc[lbl]
+                S3_vz_mass[lbl] += S3_vz_mass_loc[lbl]
+                S3_P_vol[lbl] += S3_P_vol_loc[lbl]
+                S3_P_mass[lbl] += S3_P_mass_loc[lbl]
+                S4_rho_vol[lbl] += S4_rho_vol_loc[lbl]
+                S4_rho_mass[lbl] += S4_rho_mass_loc[lbl]
+                S4_T_vol[lbl] += S4_T_vol_loc[lbl]
+                S4_T_mass[lbl] += S4_T_mass_loc[lbl]
+                S4_vx_vol[lbl] += S4_vx_vol_loc[lbl]
+                S4_vx_mass[lbl] += S4_vx_mass_loc[lbl]
+                S4_vy_vol[lbl] += S4_vy_vol_loc[lbl]
+                S4_vy_mass[lbl] += S4_vy_mass_loc[lbl]
+                S4_vz_vol[lbl] += S4_vz_vol_loc[lbl]
+                S4_vz_mass[lbl] += S4_vz_mass_loc[lbl]
+                S4_P_vol[lbl] += S4_P_vol_loc[lbl]
+                S4_P_mass[lbl] += S4_P_mass_loc[lbl]
+
+        return (W_vol, W_mass,
+                S1_rho_vol, S1_rho_mass, S1_T_vol, S1_T_mass,
+                S1_vx_vol, S1_vx_mass, S1_vy_vol, S1_vy_mass,
+                S1_vz_vol, S1_vz_mass, S1_P_vol, S1_P_mass,
+                S2_rho_vol, S2_rho_mass, S2_T_vol, S2_T_mass,
+                S2_vx_vol, S2_vx_mass, S2_vy_vol, S2_vy_mass,
+                S2_vz_vol, S2_vz_mass, S2_P_vol, S2_P_mass,
+                S3_rho_vol, S3_rho_mass, S3_T_vol, S3_T_mass,
+                S3_vx_vol, S3_vx_mass, S3_vy_vol, S3_vy_mass,
+                S3_vz_vol, S3_vz_mass, S3_P_vol, S3_P_mass,
+                S4_rho_vol, S4_rho_mass, S4_T_vol, S4_T_mass,
+                S4_vx_vol, S4_vx_mass, S4_vy_vol, S4_vy_mass,
+                S4_vz_vol, S4_vz_mass, S4_P_vol, S4_P_mass)
+
+    @numba.njit(parallel=True, cache=True)
     def _minkowski_single_pass_numba(labels: np.ndarray, K: int,
                                       euler_lut: np.ndarray,
                                       curv_weights: np.ndarray) -> tuple:
@@ -880,6 +1177,237 @@ try:
 
 except ImportError:
     _NUMBA_AVAILABLE = False
+
+
+def covariance_tensor_fast(labels: np.ndarray,
+                            dens: np.ndarray,
+                            node_bbox: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+                            dx: float, dy: float, dz: float,
+                            origin: tuple[float, float, float],
+                            K: int | None = None) -> tuple:
+    """Compute mass-weighted covariance tensor sums for shape diagnostics.
+
+    Uses Numba-accelerated parallel computation when available.
+    This replaces the O(N²) nested loops with a single O(N) pass.
+
+    Parameters
+    ----------
+    labels : 3D int32 array
+        Label array where 0 = background, 1..K = clump labels.
+    dens : 3D float array
+        Density field (same shape as labels).
+    node_bbox : tuple
+        ((i0, i1), (j0, j1), (k0, k1)) global index bounds.
+    dx, dy, dz : float
+        Grid spacing.
+    origin : tuple
+        (x0, y0, z0) physical origin.
+    K : int, optional
+        Number of labels.
+
+    Returns
+    -------
+    W, Sx, Sy, Sz, Sxx, Syy, Szz, Sxy, Sxz, Syz : (K,) arrays
+        First and second moment sums for each label (background excluded).
+    """
+    K = _ensure_K(labels, K)
+    if K == 0:
+        empty = np.zeros((0,), dtype=np.float64)
+        return (empty,) * 10
+
+    (i0, i1), (j0, j1), (k0, k1) = node_bbox
+    Vc = float(dx * dy * dz)
+
+    # Coordinate arrays
+    xi = (origin[0] + (np.arange(i0, i1) + 0.5) * dx).astype(np.float64)
+    yj = (origin[1] + (np.arange(j0, j1) + 0.5) * dy).astype(np.float64)
+    zk = (origin[2] + (np.arange(k0, k1) + 0.5) * dz).astype(np.float64)
+
+    # Ensure dens is float64 for Numba
+    dens_f64 = dens.astype(np.float64, copy=False)
+
+    if _NUMBA_AVAILABLE:
+        result = _covariance_tensor_numba(labels, dens_f64, xi, yj, zk, Vc, K)
+        # Return without background (index 0)
+        return tuple(arr[1:] for arr in result)
+    else:
+        # Fallback: pure numpy plane-by-plane (slower but correct)
+        W = np.zeros(K + 1, dtype=np.float64)
+        Sx = np.zeros(K + 1, dtype=np.float64)
+        Sy = np.zeros(K + 1, dtype=np.float64)
+        Sz = np.zeros(K + 1, dtype=np.float64)
+        Sxx = np.zeros(K + 1, dtype=np.float64)
+        Syy = np.zeros(K + 1, dtype=np.float64)
+        Szz = np.zeros(K + 1, dtype=np.float64)
+        Sxy = np.zeros(K + 1, dtype=np.float64)
+        Sxz = np.zeros(K + 1, dtype=np.float64)
+        Syz = np.zeros(K + 1, dtype=np.float64)
+
+        ni, nj, nk = labels.shape
+        for i in range(ni):
+            L = labels[i, :, :].ravel()
+            w = dens_f64[i, :, :].ravel() * Vc
+            bc = np.bincount(L, weights=w, minlength=K + 1)
+            W += bc
+            Sx += xi[i] * bc
+            Sxx += (xi[i] * xi[i]) * bc
+
+        for j in range(nj):
+            L = labels[:, j, :].ravel()
+            w = dens_f64[:, j, :].ravel() * Vc
+            bc = np.bincount(L, weights=w, minlength=K + 1)
+            Sy += yj[j] * bc
+            Syy += (yj[j] * yj[j]) * bc
+
+        for k in range(nk):
+            L = labels[:, :, k].ravel()
+            w = dens_f64[:, :, k].ravel() * Vc
+            bc = np.bincount(L, weights=w, minlength=K + 1)
+            Sz += zk[k] * bc
+            Szz += (zk[k] * zk[k]) * bc
+
+        for j in range(nj):
+            for i in range(ni):
+                L = labels[i, j, :]
+                w = dens_f64[i, j, :] * Vc
+                bc = np.bincount(L, weights=w, minlength=K + 1)
+                Sxy += (xi[i] * yj[j]) * bc
+
+        for k in range(nk):
+            for i in range(ni):
+                L = labels[i, :, k]
+                w = dens_f64[i, :, k] * Vc
+                bc = np.bincount(L, weights=w, minlength=K + 1)
+                Sxz += (xi[i] * zk[k]) * bc
+
+        for k in range(nk):
+            for j in range(nj):
+                L = labels[:, j, k]
+                w = dens_f64[:, j, k] * Vc
+                bc = np.bincount(L, weights=w, minlength=K + 1)
+                Syz += (yj[j] * zk[k]) * bc
+
+        return (W[1:], Sx[1:], Sy[1:], Sz[1:], Sxx[1:], Syy[1:], Szz[1:], Sxy[1:], Sxz[1:], Syz[1:])
+
+
+def thermo_moments_fast(labels: np.ndarray,
+                         rho: np.ndarray, T: np.ndarray,
+                         vx: np.ndarray, vy: np.ndarray, vz: np.ndarray,
+                         P: np.ndarray,
+                         Vc: float,
+                         K: int | None = None,
+                         excess_kurtosis: bool = False) -> dict[str, np.ndarray]:
+    """Compute mean/std/skew/kurt for 6 thermo fields in one Numba-accelerated pass.
+
+    This is ~10-20x faster than calling per_label_stats 12 times.
+
+    Parameters
+    ----------
+    labels : 3D int32 array
+    rho, T, vx, vy, vz, P : 3D float arrays (same shape as labels)
+    Vc : float
+        Cell volume.
+    K : int, optional
+    excess_kurtosis : bool
+        If True, subtract 3 from kurtosis.
+
+    Returns
+    -------
+    dict with keys like 'rho_mean', 'rho_std', 'rho_skew', 'rho_kurt',
+                        'rho_mean_massw', 'rho_std_massw', etc.
+    """
+    K = _ensure_K(labels, K)
+    if K == 0:
+        return {}
+
+    small = 1e-300
+
+    # Prepare weight arrays
+    w_vol = np.full(labels.shape, float(Vc), dtype=np.float64)
+    w_mass = rho.astype(np.float64, copy=False) * float(Vc)
+
+    # Ensure all inputs are float64 for Numba
+    rho64 = rho.astype(np.float64, copy=False)
+    T64 = T.astype(np.float64, copy=False)
+    vx64 = vx.astype(np.float64, copy=False)
+    vy64 = vy.astype(np.float64, copy=False)
+    vz64 = vz.astype(np.float64, copy=False)
+    P64 = P.astype(np.float64, copy=False)
+
+    if not _NUMBA_AVAILABLE:
+        # Fallback to per_label_stats loop
+        result = {}
+        for name, arr in (("rho", rho64), ("T", T64), ("vx", vx64),
+                          ("vy", vy64), ("vz", vz64), ("pressure", P64)):
+            mu, sd, sk, ku = per_label_stats(labels, arr, weights=w_vol, K=K,
+                                              excess_kurtosis=excess_kurtosis)
+            result[f"{name}_mean"] = mu
+            result[f"{name}_std"] = sd
+            result[f"{name}_skew"] = sk
+            result[f"{name}_kurt"] = ku
+            mu_m, sd_m, sk_m, ku_m = per_label_stats(labels, arr, weights=w_mass, K=K,
+                                                      excess_kurtosis=excess_kurtosis)
+            result[f"{name}_mean_massw"] = mu_m
+            result[f"{name}_std_massw"] = sd_m
+            result[f"{name}_skew_massw"] = sk_m
+            result[f"{name}_kurt_massw"] = ku_m
+        return result
+
+    # Call Numba kernel
+    raw = _thermo_moments_numba(labels, rho64, T64, vx64, vy64, vz64, P64,
+                                 w_vol, w_mass, K)
+
+    # Unpack results (skip background index 0)
+    W_vol = raw[0][1:]
+    W_mass = raw[1][1:]
+
+    # Raw moments: S1, S2, S3, S4 for each field × weight
+    # Index mapping: 2 + field*2 + weight for S1, etc.
+    fields = ["rho", "T", "vx", "vy", "vz", "pressure"]
+
+    def derive_stats(W, S1, S2, S3, S4):
+        """Derive mean/std/skew/kurt from raw moments."""
+        mu = S1 / (W + small)
+        var = S2 / (W + small) - mu * mu
+        var = np.maximum(var, 0.0)  # numerical safety
+        std = np.sqrt(var)
+        # Central moments for skew/kurt
+        m2 = var
+        m3 = S3 / (W + small) - 3 * mu * S2 / (W + small) + 2 * mu**3
+        m4 = S4 / (W + small) - 4 * mu * S3 / (W + small) + 6 * mu**2 * S2 / (W + small) - 3 * mu**4
+        skew = m3 / (std**3 + small)
+        kurt = m4 / (m2**2 + small)
+        if excess_kurtosis:
+            kurt = kurt - 3.0
+        return mu, std, skew, kurt
+
+    result = {}
+    for fi, name in enumerate(fields):
+        # Volume-weighted: index 2 + fi*2
+        idx_vol = 2 + fi * 2
+        S1_vol = raw[idx_vol][1:]
+        S2_vol = raw[idx_vol + 12][1:]  # S2 starts at index 14
+        S3_vol = raw[idx_vol + 24][1:]  # S3 starts at index 26
+        S4_vol = raw[idx_vol + 36][1:]  # S4 starts at index 38
+        mu, sd, sk, ku = derive_stats(W_vol, S1_vol, S2_vol, S3_vol, S4_vol)
+        result[f"{name}_mean"] = mu
+        result[f"{name}_std"] = sd
+        result[f"{name}_skew"] = sk
+        result[f"{name}_kurt"] = ku
+
+        # Mass-weighted: index 2 + fi*2 + 1
+        idx_mass = 2 + fi * 2 + 1
+        S1_mass = raw[idx_mass][1:]
+        S2_mass = raw[idx_mass + 12][1:]
+        S3_mass = raw[idx_mass + 24][1:]
+        S4_mass = raw[idx_mass + 36][1:]
+        mu_m, sd_m, sk_m, ku_m = derive_stats(W_mass, S1_mass, S2_mass, S3_mass, S4_mass)
+        result[f"{name}_mean_massw"] = mu_m
+        result[f"{name}_std_massw"] = sd_m
+        result[f"{name}_skew_massw"] = sk_m
+        result[f"{name}_kurt_massw"] = ku_m
+
+    return result
 
 
 def minkowski_functionals_single_pass(labels: np.ndarray,
@@ -1084,7 +1612,8 @@ def compute_minkowski_functionals(labels: np.ndarray,
                                    dx: float = 1.0, dy: float = 1.0, dz: float = 1.0,
                                    K: int | None = None,
                                    min_cells: int = 1000,
-                                   cell_count: np.ndarray | None = None) -> dict[str, np.ndarray]:
+                                   cell_count: np.ndarray | None = None,
+                                   skip_mask: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """Compute Minkowski functionals and shapefinders for clumps above size threshold.
 
     This is the main entry point for Tier 2 shape metrics. It computes the
@@ -1110,6 +1639,9 @@ def compute_minkowski_functionals(labels: np.ndarray,
         Clumps below this threshold get NaN values.
     cell_count : (K,) array, optional
         Cell counts per clump. If None, will be computed from labels.
+    skip_mask : (K,) bool array, optional
+        If provided, clumps where skip_mask[i] is True will be skipped
+        (e.g., boundary-touching clumps that span multiple nodes).
 
     Returns
     -------
@@ -1140,8 +1672,10 @@ def compute_minkowski_functionals(labels: np.ndarray,
     if cell_count is None:
         cell_count = num_cells(labels, K=K)
 
-    # Determine which clumps meet the threshold
+    # Determine which clumps meet the threshold AND are not in skip_mask
     compute_mask = cell_count >= min_cells
+    if skip_mask is not None:
+        compute_mask = compute_mask & ~skip_mask
     n_compute = np.sum(compute_mask)
 
     # Initialize outputs with NaN
@@ -1153,20 +1687,36 @@ def compute_minkowski_functionals(labels: np.ndarray,
     planarity_out = np.full(K, np.nan, dtype=np.float64)
 
     if n_compute > 0:
-        # Compute integrated mean curvature for ALL labels (the function is O(N))
-        # then we just mask the results
-        curvature_all = integrated_mean_curvature(labels, dx, dy, dz, K=K)
+        # Get indices of labels to compute
+        compute_indices = np.where(compute_mask)[0]
+
+        # Create a masked labels array: zero out labels we don't need to compute
+        # This dramatically reduces K_effective for the O(N × K) Numba loop
+        labels_masked = labels.copy()
+        label_to_new = np.zeros(K + 1, dtype=np.int32)
+        for new_idx, old_idx in enumerate(compute_indices):
+            label_to_new[old_idx + 1] = new_idx + 1  # +1 because labels are 1-indexed
+        labels_masked = label_to_new[labels_masked]
+        K_eff = len(compute_indices)
+
+        # Compute integrated mean curvature only for the masked subset
+        curvature_subset = integrated_mean_curvature(labels_masked, dx, dy, dz, K=K_eff)
+
+        # Map euler_chi to the subset for shapefinder computation
+        euler_subset = euler_chi[compute_indices]
+        volume_subset = volume[compute_indices]
+        area_subset = area[compute_indices]
 
         # Compute shapefinders for qualifying clumps
-        shapefinders = minkowski_shapefinders(volume, area, curvature_all, euler_chi)
+        shapefinders = minkowski_shapefinders(volume_subset, area_subset, curvature_subset, euler_subset)
 
-        # Store results only for clumps meeting threshold
-        curvature_out[compute_mask] = curvature_all[compute_mask]
-        thickness_out[compute_mask] = shapefinders["thickness"][compute_mask]
-        breadth_out[compute_mask] = shapefinders["breadth"][compute_mask]
-        length_out[compute_mask] = shapefinders["length"][compute_mask]
-        filamentarity_out[compute_mask] = shapefinders["filamentarity"][compute_mask]
-        planarity_out[compute_mask] = shapefinders["planarity"][compute_mask]
+        # Store results back into full arrays
+        curvature_out[compute_mask] = curvature_subset
+        thickness_out[compute_mask] = shapefinders["thickness"]
+        breadth_out[compute_mask] = shapefinders["breadth"]
+        length_out[compute_mask] = shapefinders["length"]
+        filamentarity_out[compute_mask] = shapefinders["filamentarity"]
+        planarity_out[compute_mask] = shapefinders["planarity"]
 
     return {
         "integrated_curvature": curvature_out,

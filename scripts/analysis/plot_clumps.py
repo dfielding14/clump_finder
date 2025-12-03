@@ -244,26 +244,7 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
     fig.savefig(os.path.join(outdir, f"{base}_size_hist.png"), bbox_inches='tight')
     plt.close(fig)
 
-    # 2) Size vs velocity dispersion
-    if have_velocity and vdisp is not None:
-        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
-        # X-axis edges consistent with size histogram
-        if (np.issubdtype(size.dtype, np.integer)) or np.allclose(size, np.round(size)):
-            r_min = int(max(1, np.nanmin(size)))
-            r_max = int(np.nanmax(size))
-            xedges = find_ell_bin_edges(r_min, r_max, n_ell_bins=60)
-        else:
-            lo = np.nanmin(size[size > 0]) if np.any(size > 0) else 1.0
-            hi = np.nanmax(size)
-            xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
-        _hist2d(ax, size, vdisp, bins=100, xlog=True, ylog=True,
-                xlabel='clump size ({})'.format('volume' if use_volume else 'cell_count'),
-                ylabel='velocity dispersion (std |v|)', xedges=xedges)
-        ax.set_title('Size vs velocity dispersion')
-        fig.savefig(os.path.join(outdir, f"{base}_size_vs_vdisp.png"), bbox_inches='tight')
-        plt.close(fig)
-    else:
-        print(f"[plot_clumps] Skipping velocity dispersion plot for {npz_path}; velocity stats unavailable.")
+    # 2) Size vs velocity dispersion - REMOVED due to numerical issues with large coordinate values
 
     # 3) Area vs size joint distribution
     area = d.get('area')
@@ -294,26 +275,122 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
         fig.savefig(os.path.join(outdir, f"{base}_area_over_vol89_vs_volume.png"), bbox_inches='tight')
         plt.close(fig)
 
-    # 4) Velocity dispersion vs volume (stitched catalogs only)
-    vel_std = d.get('velocity_std')
-    if vel_std is not None and volume_for_area is not None:
-        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
-        vol = volume_for_area.astype(np.float64, copy=False)
-        vel = vel_std.astype(np.float64, copy=False)
-        m = np.isfinite(vol) & np.isfinite(vel) & (vol > 0) & (vel > 0)
-        if m.any():
-            vol = vol[m]
-            vel = vel[m]
-            lo = np.nanmin(vol)
-            hi = np.nanmax(vol)
-            xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
-            _hist2d(ax, vol, vel, bins=100, xlog=True, ylog=True,
-                    xlabel='clump volume [Δx^3]', ylabel='velocity dispersion', xedges=xedges)
-            ax.set_title('Velocity dispersion vs volume')
+    # 4) Velocity dispersion vs volume - REMOVED due to numerical issues
+
+    # 5) Mass spectrum: M * dN/dlogM
+    mass = d.get('mass')
+    if mass is not None:
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
+        mass_pos = mass[np.isfinite(mass) & (mass > 0)]
+        if mass_pos.size > 0:
+            lo = np.nanmin(mass_pos)
+            hi = np.nanmax(mass_pos)
+            edges = np.logspace(np.log10(lo), np.log10(hi), 60)
+            counts, _ = np.histogram(mass_pos, bins=edges)
+            log_width = np.log(edges[1:]) - np.log(edges[:-1])
+            m_mid = np.sqrt(edges[1:] * edges[:-1])
+            spectrum = np.divide(m_mid * counts, log_width,
+                                 out=np.full_like(counts, np.nan, dtype=np.float64),
+                                 where=log_width > 0)
+            ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.set_xlabel('M [code units]')
+            ax.set_ylabel('M · dN / dlog M')
+            ax.set_title('Clump mass spectrum')
         else:
-            ax.text(0.5, 0.5, "No data", ha='center', va='center')
-        fig.savefig(os.path.join(outdir, f"{base}_velocity_std_vs_volume.png"), bbox_inches='tight')
+            ax.text(0.5, 0.5, "No mass data", ha='center', va='center')
+        fig.savefig(os.path.join(outdir, f"{base}_mass_spectrum.png"), bbox_inches='tight')
         plt.close(fig)
+
+    # 6) Surface area spectrum: A * dN/dlogA
+    area = d.get('area')
+    if area is not None:
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
+        area_pos = area[np.isfinite(area) & (area > 0)]
+        if area_pos.size > 0:
+            lo = np.nanmin(area_pos)
+            hi = np.nanmax(area_pos)
+            edges = np.logspace(np.log10(lo), np.log10(hi), 60)
+            counts, _ = np.histogram(area_pos, bins=edges)
+            log_width = np.log(edges[1:]) - np.log(edges[:-1])
+            a_mid = np.sqrt(edges[1:] * edges[:-1])
+            spectrum = np.divide(a_mid * counts, log_width,
+                                 out=np.full_like(counts, np.nan, dtype=np.float64),
+                                 where=log_width > 0)
+            ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.set_xlabel('A [Δx^2]')
+            ax.set_ylabel('A · dN / dlog A')
+            ax.set_title('Clump surface area spectrum')
+        else:
+            ax.text(0.5, 0.5, "No area data", ha='center', va='center')
+        fig.savefig(os.path.join(outdir, f"{base}_area_spectrum.png"), bbox_inches='tight')
+        plt.close(fig)
+
+    # 7) Shape metrics vs size (sphericity, compactness, triaxiality, elongation)
+    shape_metrics = [
+        ('sphericity', 'Sphericity', (0, 1)),
+        ('compactness', 'Compactness', (0, 1)),
+        ('triaxiality', 'Triaxiality T', (0, 1)),
+        ('elongation', 'Elongation', (1, 1e3)),  # reasonable range for axis ratio
+    ]
+    has_shape = any(d.get(m[0]) is not None for m in shape_metrics)
+    if has_shape:
+        fig, axes = plt.subplots(2, 2, figsize=(10, 8), dpi=150)
+        axes = axes.flatten()
+        for ax, (key, label, ylim) in zip(axes, shape_metrics):
+            metric = d.get(key)
+            if metric is None:
+                ax.text(0.5, 0.5, f"No {key} data", ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'{label} vs Size')
+                continue
+            # For elongation, use log scale and filter reasonable values
+            is_elongation = (key == 'elongation')
+            if is_elongation:
+                mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & (metric > 0) & (metric < 1e6)
+            else:
+                mask = np.isfinite(size) & np.isfinite(metric) & (size > 0)
+            x = size[mask]
+            y = metric[mask]
+            if x.size > 0:
+                _hist2d(ax, x, y, bins=80, xlog=True, ylog=is_elongation, xlabel='cell_count', ylabel=label)
+                if ylim and not is_elongation:
+                    ax.set_ylim(ylim)
+            else:
+                ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{label} vs Size')
+        fig.suptitle('Shape metrics vs clump size', y=1.02)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{base}_shape_vs_size.png"), bbox_inches='tight')
+        plt.close(fig)
+
+    # 8) Axis ratios vs size (b/a and c/a)
+    axis_ratios = d.get('axis_ratios')
+    if axis_ratios is not None and axis_ratios.ndim == 2 and axis_ratios.shape[1] >= 2:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), dpi=150)
+        ratio_labels = [('b/a (intermediate/major)', 0), ('c/a (minor/major)', 1)]
+        for ax, (rlabel, idx) in zip(axes, ratio_labels):
+            ratio = axis_ratios[:, idx]
+            mask = np.isfinite(size) & np.isfinite(ratio) & (size > 0) & (ratio > 0)
+            x = size[mask]
+            y = ratio[mask]
+            if x.size > 0:
+                _hist2d(ax, x, y, bins=80, xlog=True, ylog=False, xlabel='cell_count', ylabel=rlabel)
+                ax.set_ylim(0, 1)
+            else:
+                ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{rlabel} vs Size')
+        fig.suptitle('Axis ratios vs clump size', y=1.02)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{base}_axis_ratios_vs_size.png"), bbox_inches='tight')
+        plt.close(fig)
+
+    # 9) Minkowski functionals - REMOVED
+    # Minkowski shapefinder values computed in stitcher are unreliable because:
+    # - Euler characteristic isn't additive across stitched fragments
+    # - Integrated curvature requires voxel-level boundary information not preserved through stitching
 
     print(f"Wrote PNGs to {outdir}")
 

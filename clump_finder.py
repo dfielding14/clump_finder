@@ -45,6 +45,11 @@ def main():
     cfg = parse_config(args.config)
     extra_stats = bool(cfg.get("extra_stats", False)) or args.extra_stats
 
+    # Fine-grained extra-stats control (all default to True when extra_stats is enabled)
+    extra_stats_moments = bool(cfg.get("extra_stats_moments", True)) if extra_stats else False
+    extra_stats_shape = bool(cfg.get("extra_stats_shape", True)) if extra_stats else False
+    extra_stats_minkowski = bool(cfg.get("extra_stats_minkowski", True)) if extra_stats else False
+
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -116,6 +121,8 @@ def main():
 
     # Load subvolume
     t0 = time.time()
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] Starting I/O load...", flush=True)
     fields = load_subvolume(node_bbox=node_bbox, cfg=io_cfg)
     dens = fields["dens"]
     temp = fields["temp"]
@@ -132,6 +139,8 @@ def main():
     vely_i = vely[s, s, s]
     velz_i = velz[s, s, s]
     t_load = time.time()
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] I/O load done in {t_load - t0:.1f}s, shape={dens.shape}", flush=True)
 
     # Threshold mask with configurable field and comparator
     cut_by = str(cfg.get("cut_by", "temperature")).lower()
@@ -152,6 +161,8 @@ def main():
     # Labeling
     tile_shape = tuple(cfg.get("tile_shape", [128, 128, 128]))
     connectivity = int(cfg.get("connectivity", 6))
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] Starting labeling (tile_shape={tile_shape})...", flush=True)
     labels_ext = label_3d(mask, tile_shape=tile_shape, connectivity=connectivity, halo=0)
     if halo > 0:
         labels_core = labels_ext[halo:-halo, halo:-halo, halo:-halo]
@@ -165,8 +176,12 @@ def main():
     labels_ext = lut[labels_ext]
     labels = labels_core
     t_label = time.time()
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] Labeling done in {t_label - t_load:.1f}s", flush=True)
 
     K = int(labels.max())
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] Found K={K} local clumps, computing basic metrics...", flush=True)
 
     # Metrics
     Vc = dx * dy * dz
@@ -188,166 +203,208 @@ def main():
     # Bounding boxes (global indices, [min,max))
     bbox_ijk = M.compute_bboxes(labels, node_bbox, K=K)
 
+    t_basic = time.time()
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] Basic metrics done in {t_basic - t_label:.1f}s", flush=True)
+
     extra_out: dict[str, np.ndarray] = {}
+
+    # Compute boundary presence early (needed for stitching metadata and Minkowski filtering)
+    presence = np.zeros((K, 6), dtype=bool)
+    for idx, arr in enumerate((labels[0, :, :],
+                               labels[-1, :, :],
+                               labels[:, 0, :],
+                               labels[:, -1, :],
+                               labels[:, :, 0],
+                               labels[:, :, -1])):
+        u = np.unique(arr)
+        u = u[(u > 0) & (u <= K)]
+        presence[u - 1, idx] = True
+    touches_boundary = presence.any(axis=1)  # True if clump touches any face
+
     if extra_stats:
-        kurtosis_excess = bool(cfg.get("excess_kurtosis", False))
-        Vc64 = float(Vc)
-        weight_vol = np.full(labels.shape, Vc64, dtype=np.float64)
-        weight_mass = dens_i.astype(np.float64, copy=False) * Vc64
-        pressure = dens_i * temp_i
+        if rank == 0:
+            print(f"[{time.strftime('%H:%M:%S')}] Starting extra-stats computation...", flush=True)
+            enabled = []
+            if extra_stats_moments:
+                enabled.append("moments")
+            if extra_stats_shape:
+                enabled.append("shape")
+            if extra_stats_minkowski:
+                enabled.append("minkowski")
+            print(f"[{time.strftime('%H:%M:%S')}] Enabled groups: {', '.join(enabled)}", flush=True)
 
-        stats = {}
-        for name, arr in (
-            ("rho", dens_i),
-            ("T", temp_i),
-            ("vx", velx_i),
-            ("vy", vely_i),
-            ("vz", velz_i),
-            ("pressure", pressure),
-        ):
-            mu, sd, sk, ku = M.per_label_stats(labels, arr, weights=weight_vol, K=K, excess_kurtosis=kurtosis_excess)
-            stats[f"{name}_mean"] = mu
-            stats[f"{name}_std"] = sd
-            stats[f"{name}_skew"] = sk
-            stats[f"{name}_kurt"] = ku
+        t_last = t_basic
 
-            mu_m, sd_m, sk_m, ku_m = M.per_label_stats(labels, arr, weights=weight_mass, K=K, excess_kurtosis=kurtosis_excess)
-            stats[f"{name}_mean_massw"] = mu_m
-            stats[f"{name}_std_massw"] = sd_m
-            stats[f"{name}_skew_massw"] = sk_m
-            stats[f"{name}_kurt_massw"] = ku_m
+        # ========== GROUP 1: Thermodynamic Moments ==========
+        if extra_stats_moments:
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Computing thermodynamic moments (Numba-accelerated)...", flush=True)
+            kurtosis_excess = bool(cfg.get("excess_kurtosis", False))
+            pressure = dens_i * temp_i
 
-        # Shape diagnostics via mass-weighted covariance tensor
-        (i0, i1), (j0, j1), (k0, k1) = node_bbox
-        xi = origin[0] + (np.arange(i0, i1) + 0.5) * dx
-        yj = origin[1] + (np.arange(j0, j1) + 0.5) * dy
-        zk = origin[2] + (np.arange(k0, k1) + 0.5) * dz
+            # Use fast single-pass Numba implementation
+            stats = M.thermo_moments_fast(
+                labels, dens_i, temp_i, velx_i, vely_i, velz_i, pressure,
+                Vc=Vc, K=K, excess_kurtosis=kurtosis_excess
+            )
 
-        W = np.zeros(K + 1, dtype=np.float64)
-        Sx = np.zeros(K + 1, dtype=np.float64)
-        Sy = np.zeros(K + 1, dtype=np.float64)
-        Sz = np.zeros(K + 1, dtype=np.float64)
-        Sxx = np.zeros(K + 1, dtype=np.float64)
-        Syy = np.zeros(K + 1, dtype=np.float64)
-        Szz = np.zeros(K + 1, dtype=np.float64)
-        Sxy = np.zeros(K + 1, dtype=np.float64)
-        Sxz = np.zeros(K + 1, dtype=np.float64)
-        Syz = np.zeros(K + 1, dtype=np.float64)
+            extra_out.update(stats)
+            t_moments = time.time()
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Thermodynamic moments done in {t_moments - t_last:.1f}s", flush=True)
+            t_last = t_moments
 
-        for i in range(labels.shape[0]):
-            L = labels[i, :, :].ravel()
-            if L.size == 0:
-                continue
-            w = (dens_i[i, :, :].ravel().astype(np.float64, copy=False)) * Vc64
-            binc = np.bincount(L, weights=w, minlength=K + 1)
-            W += binc
-            x = xi[i]
-            Sx += x * binc
-            Sxx += (x * x) * binc
+        # ========== GROUP 2: Shape Metrics (Covariance + Derived + Euler + Bbox) ==========
+        if extra_stats_shape:
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Computing covariance tensors (shape={labels.shape})...", flush=True)
 
-        for j in range(labels.shape[1]):
-            L = labels[:, j, :].ravel()
-            w = (dens_i[:, j, :].ravel().astype(np.float64, copy=False)) * Vc64
-            binc = np.bincount(L, weights=w, minlength=K + 1)
-            y = yj[j]
-            Sy += y * binc
-            Syy += (y * y) * binc
+            # Shape diagnostics via mass-weighted covariance tensor (Numba-accelerated)
+            W, Sx, Sy, Sz, Sxx, Syy, Szz, Sxy, Sxz, Syz = M.covariance_tensor_fast(
+                labels, dens_i, node_bbox, dx, dy, dz, origin, K=K
+            )
 
-        for k in range(labels.shape[2]):
-            L = labels[:, :, k].ravel()
-            w = (dens_i[:, :, k].ravel().astype(np.float64, copy=False)) * Vc64
-            binc = np.bincount(L, weights=w, minlength=K + 1)
-            z = zk[k]
-            Sz += z * binc
-            Szz += (z * z) * binc
+            small = 1e-300
+            # Use safe division to prevent overflow
+            W_safe = np.where(W > small, W, small)
+            mu_x = Sx / W_safe
+            mu_y = Sy / W_safe
+            mu_z = Sz / W_safe
 
-        for j in range(labels.shape[1]):
-            y = yj[j]
-            for i in range(labels.shape[0]):
-                L = labels[i, j, :]
-                if L.size == 0:
+            # Compute covariance components with overflow protection
+            Cxx = np.clip(Sxx / W_safe - mu_x * mu_x, -1e30, 1e30)
+            Cyy = np.clip(Syy / W_safe - mu_y * mu_y, -1e30, 1e30)
+            Czz = np.clip(Szz / W_safe - mu_z * mu_z, -1e30, 1e30)
+            Cxy = np.clip(Sxy / W_safe - mu_x * mu_y, -1e30, 1e30)
+            Cxz = np.clip(Sxz / W_safe - mu_x * mu_z, -1e30, 1e30)
+            Cyz = np.clip(Syz / W_safe - mu_y * mu_z, -1e30, 1e30)
+
+            # Replace any remaining inf/nan with zeros
+            for arr in (Cxx, Cyy, Czz, Cxy, Cxz, Cyz):
+                arr[~np.isfinite(arr)] = 0.0
+
+            principal_axes_lengths = np.zeros((K, 3), dtype=np.float64)
+            axis_ratios = np.zeros((K, 2), dtype=np.float64)
+            orientation = np.zeros((K, 3, 3), dtype=np.float64)
+            for idx in range(K):
+                C = np.array([[Cxx[idx], Cxy[idx], Cxz[idx]],
+                              [Cxy[idx], Cyy[idx], Cyz[idx]],
+                              [Cxz[idx], Cyz[idx], Czz[idx]]], dtype=np.float64)
+                C = (C + C.T) * 0.5
+                # Handle invalid covariance matrices gracefully
+                if not np.all(np.isfinite(C)):
+                    orientation[idx, :, :] = np.eye(3)
                     continue
-                w = (dens_i[i, j, :].astype(np.float64, copy=False)) * Vc64
-                Sxy += (xi[i] * y) * np.bincount(L, weights=w, minlength=K + 1)
+                try:
+                    vals, vecs = np.linalg.eigh(C)
+                except np.linalg.LinAlgError:
+                    # Eigenvalue computation failed - use identity orientation
+                    orientation[idx, :, :] = np.eye(3)
+                    continue
+                order = np.argsort(vals)[::-1]
+                vals = vals[order]
+                vecs = vecs[:, order]
+                a = np.sqrt(max(vals[0], 0.0))
+                b = np.sqrt(max(vals[1], 0.0))
+                c = np.sqrt(max(vals[2], 0.0))
+                principal_axes_lengths[idx, :] = (a, b, c)
+                axis_ratios[idx, :] = (b / (a + small), c / (a + small))
+                orientation[idx, :, :] = vecs
 
-        for k in range(labels.shape[2]):
-            z = zk[k]
-            for i in range(labels.shape[0]):
-                L = labels[i, :, k]
-                w = (dens_i[i, :, k].astype(np.float64, copy=False)) * Vc64
-                Sxz += (xi[i] * z) * np.bincount(L, weights=w, minlength=K + 1)
+            t_cov = time.time()
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Covariance tensors done in {t_cov - t_last:.1f}s", flush=True)
+                print(f"[{time.strftime('%H:%M:%S')}] Computing derived shape metrics...", flush=True)
 
-        for k in range(labels.shape[2]):
-            z = zk[k]
-            for j in range(labels.shape[1]):
-                L = labels[:, j, k]
-                w = (dens_i[:, j, k].astype(np.float64, copy=False)) * Vc64
-                Syz += (yj[j] * z) * np.bincount(L, weights=w, minlength=K + 1)
+            # Tier 0: Derived shape metrics from existing V, S, principal axes
+            derived_metrics = M.derived_shape_metrics(vol, area, principal_axes_lengths)
 
-        W = W[1:]
-        Sx = Sx[1:]; Sy = Sy[1:]; Sz = Sz[1:]
-        Sxx = Sxx[1:]; Syy = Syy[1:]; Szz = Szz[1:]
-        Sxy = Sxy[1:]; Sxz = Sxz[1:]; Syz = Syz[1:]
+            # Tier 1a: Euler characteristic (fast numpy implementation)
+            euler_chi = M.euler_characteristic_fast(labels, K=K)
 
-        small = 1e-300
-        mu_x = Sx / (W + small)
-        mu_y = Sy / (W + small)
-        mu_z = Sz / (W + small)
+            # Tier 1b: Bounding box shape metrics
+            bbox_metrics = M.bbox_shape_metrics(bbox_ijk, principal_axes_lengths)
 
-        Cxx = Sxx / (W + small) - mu_x * mu_x
-        Cyy = Syy / (W + small) - mu_y * mu_y
-        Czz = Szz / (W + small) - mu_z * mu_z
-        Cxy = Sxy / (W + small) - mu_x * mu_y
-        Cxz = Sxz / (W + small) - mu_x * mu_z
-        Cyz = Syz / (W + small) - mu_y * mu_z
+            t_shape = time.time()
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Shape metrics done in {t_shape - t_cov:.1f}s", flush=True)
 
-        principal_axes_lengths = np.zeros((K, 3), dtype=np.float64)
-        axis_ratios = np.zeros((K, 2), dtype=np.float64)
-        orientation = np.zeros((K, 3, 3), dtype=np.float64)
-        for idx in range(K):
-            C = np.array([[Cxx[idx], Cxy[idx], Cxz[idx]],
-                          [Cxy[idx], Cyy[idx], Cyz[idx]],
-                          [Cxz[idx], Cyz[idx], Czz[idx]]], dtype=np.float64)
-            C = (C + C.T) * 0.5
-            vals, vecs = np.linalg.eigh(C)
-            order = np.argsort(vals)[::-1]
-            vals = vals[order]
-            vecs = vecs[:, order]
-            a = np.sqrt(max(vals[0], 0.0))
-            b = np.sqrt(max(vals[1], 0.0))
-            c = np.sqrt(max(vals[2], 0.0))
-            principal_axes_lengths[idx, :] = (a, b, c)
-            axis_ratios[idx, :] = (b / (a + small), c / (a + small))
-            orientation[idx, :, :] = vecs
+            extra_out.update({
+                "principal_axes_lengths": principal_axes_lengths,
+                "axis_ratios": axis_ratios,
+                "orientation": orientation,
+                # Raw covariance tensor sums (for proper stitching)
+                "cov_W": W,
+                "cov_Sx": Sx,
+                "cov_Sy": Sy,
+                "cov_Sz": Sz,
+                "cov_Sxx": Sxx,
+                "cov_Syy": Syy,
+                "cov_Szz": Szz,
+                "cov_Sxy": Sxy,
+                "cov_Sxz": Sxz,
+                "cov_Syz": Syz,
+                # Tier 0: Derived shape metrics
+                "triaxiality": derived_metrics["triaxiality"],
+                "sphericity": derived_metrics["sphericity"],
+                "compactness": derived_metrics["compactness"],
+                "r_eff": derived_metrics["r_eff"],
+                "elongation": derived_metrics["elongation"],
+                # Tier 1a: Euler characteristic
+                "euler_characteristic": euler_chi,
+                # Tier 1b: Bounding box shape metrics
+                "bbox_lengths": bbox_metrics["bbox_lengths"],
+                "bbox_elongation": bbox_metrics["bbox_elongation"],
+                "bbox_flatness": bbox_metrics["bbox_flatness"],
+                "curvature_flag": bbox_metrics["curvature_flag"],
+            })
+            t_last = t_shape
 
-        # Tier 0: Derived shape metrics from existing V, S, principal axes
-        derived_metrics = M.derived_shape_metrics(vol, area, principal_axes_lengths)
+        # ========== GROUP 3: Minkowski Functionals ==========
+        if extra_stats_minkowski:
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Computing Minkowski functionals...", flush=True)
 
-        # Tier 1a: Euler characteristic
-        euler_chi = M.euler_characteristic_fast(labels, K=K)
+            # Minkowski requires euler_chi; compute if not already done
+            if not extra_stats_shape:
+                euler_chi = M.euler_characteristic_fast(labels, K=K)
 
-        # Tier 1b: Bounding box shape metrics
-        bbox_metrics = M.bbox_shape_metrics(bbox_ijk, principal_axes_lengths)
+            minkowski_min_cells = int(cfg.get("minkowski_min_cells", 1000))
 
-        # Tier 2: Minkowski functionals (selective, above size threshold)
-        minkowski_min_cells = int(cfg.get("minkowski_min_cells", 1000))
-        minkowski_metrics = M.compute_minkowski_functionals(
-            labels, vol, area, euler_chi,
-            dx=dx, dy=dy, dz=dz, K=K,
-            min_cells=minkowski_min_cells,
-            cell_count=cell_count
-        )
+            # Compute Minkowski with boundary-touching mask to skip ineligible clumps
+            minkowski_metrics = M.compute_minkowski_functionals(
+                labels, vol, area, euler_chi,
+                dx=dx, dy=dy, dz=dz, K=K,
+                min_cells=minkowski_min_cells,
+                cell_count=cell_count,
+                skip_mask=touches_boundary  # Skip clumps touching node boundaries
+            )
 
-        presence = np.zeros((K, 6), dtype=bool)
-        for idx, arr in enumerate((labels[0, :, :],
-                                   labels[-1, :, :],
-                                   labels[:, 0, :],
-                                   labels[:, -1, :],
-                                   labels[:, :, 0],
-                                   labels[:, :, -1])):
-            u = np.unique(arr)
-            u = u[(u > 0) & (u <= K)]
-            presence[u - 1, idx] = True
+            n_boundary = int(touches_boundary.sum())
+            n_computed = int(minkowski_metrics["minkowski_computed"].sum())
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Minkowski: {n_computed} computed, {n_boundary} skipped (boundary)", flush=True)
+
+            t_mink = time.time()
+            if rank == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Minkowski done in {t_mink - t_last:.1f}s", flush=True)
+
+            extra_out.update({
+                "integrated_curvature": minkowski_metrics["integrated_curvature"],
+                "thickness": minkowski_metrics["thickness"],
+                "breadth": minkowski_metrics["breadth"],
+                "length": minkowski_metrics["length"],
+                "filamentarity": minkowski_metrics["filamentarity"],
+                "planarity": minkowski_metrics["planarity"],
+                "minkowski_computed": minkowski_metrics["minkowski_computed"],
+                "minkowski_min_cells": np.int32(minkowski_min_cells),
+            })
+            t_last = t_mink
+
+        # ========== Stitching Metadata (always included) ==========
+        if rank == 0:
+            print(f"[{time.strftime('%H:%M:%S')}] Preparing boundary data for stitching...", flush=True)
 
         pair_bits = np.zeros((K,), dtype=np.uint16)
         pairs = [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
@@ -359,47 +416,9 @@ def main():
             both = presence[:, a] & presence[:, b]
             pair_bits |= (both.astype(np.uint16) << np.uint16(bit))
 
-        extra_out.update(stats)
         extra_out.update({
-            "principal_axes_lengths": principal_axes_lengths,
-            "axis_ratios": axis_ratios,
-            "orientation": orientation,
-            # Raw covariance tensor sums (for proper stitching)
-            # These can be combined across ranks to recompute shape metrics
-            "cov_W": W,      # total mass (weight)
-            "cov_Sx": Sx,    # first moment x
-            "cov_Sy": Sy,    # first moment y
-            "cov_Sz": Sz,    # first moment z
-            "cov_Sxx": Sxx,  # second moment xx
-            "cov_Syy": Syy,  # second moment yy
-            "cov_Szz": Szz,  # second moment zz
-            "cov_Sxy": Sxy,  # second moment xy
-            "cov_Sxz": Sxz,  # second moment xz
-            "cov_Syz": Syz,  # second moment yz
-            # Tier 0: Derived shape metrics
-            "triaxiality": derived_metrics["triaxiality"],
-            "sphericity": derived_metrics["sphericity"],
-            "compactness": derived_metrics["compactness"],
-            "r_eff": derived_metrics["r_eff"],
-            "elongation": derived_metrics["elongation"],
-            # Tier 1a: Euler characteristic
-            "euler_characteristic": euler_chi,
-            # Tier 1b: Bounding box shape metrics
-            "bbox_lengths": bbox_metrics["bbox_lengths"],
-            "bbox_elongation": bbox_metrics["bbox_elongation"],
-            "bbox_flatness": bbox_metrics["bbox_flatness"],
-            "curvature_flag": bbox_metrics["curvature_flag"],
-            # Tier 2: Minkowski functionals and shapefinders
-            "integrated_curvature": minkowski_metrics["integrated_curvature"],
-            "thickness": minkowski_metrics["thickness"],
-            "breadth": minkowski_metrics["breadth"],
-            "length": minkowski_metrics["length"],
-            "filamentarity": minkowski_metrics["filamentarity"],
-            "planarity": minkowski_metrics["planarity"],
-            "minkowski_computed": minkowski_metrics["minkowski_computed"],
-            "minkowski_min_cells": np.int32(minkowski_min_cells),
-            # Stitching metadata
             "face_presence": presence,
+            "touches_boundary": touches_boundary,
             "face_pair_bits": pair_bits,
             "shell_t": np.int32(3),
             "shell_xneg": labels[0:3, :, :].astype(np.uint32, copy=False),
@@ -495,6 +514,8 @@ def main():
         out.update(extra_out)
 
     part_path = os.path.join(out_dir, f"clumps_rank{rank:05d}.npz")
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] Saving output to {part_path}...", flush=True)
     np.savez(part_path, **out)
 
     t_done = time.time()

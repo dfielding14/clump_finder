@@ -10,14 +10,14 @@ field_dtype: float32
 gamma: 1.6666666666666667
 ghost_width: 1
 intra_node_threads: 56
-log_dir: logs/n2560_sweep/conn6_T0p02_step00036
+log_dir: logs/n2560_sweep/conn6_T0p02_step00036_8node
 min_clump_cells: 8
 mpi_mode: one_rank_per_node
 origin:
 - 0.0
 - 0.0
 - 0.0
-output_dir: clump_out/n2560_sweep/conn6_T0p02_step00036
+output_dir: clump_out/n2560_sweep/conn6_T0p02_step00036_8node
 periodic:
 - true
 - true
@@ -29,12 +29,15 @@ step: 36
 stitch_flag: false
 temperature_threshold: 0.02
 tile_shape:
-- 320
-- 320
-- 320
+- 640
+- 640
+- 640
 verify_one_rank_per_node: true
 
-# Extra-stats group control (all default to true when --extra-stats is used)
+# Extra-stats group control
 extra_stats_moments: true    # Thermodynamic moments (rho, T, v, P)
 extra_stats_shape: true      # Covariance tensor, Euler, derived shape metrics
-extra_stats_minkowski: false # Minkowski functionals (slow, skip for now)
+extra_stats_minkowski: true  # Minkowski functionals (enabled with high threshold)
+
+# Minkowski only for large clumps that don't touch boundaries
+minkowski_min_cells: 50000
