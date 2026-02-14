@@ -308,28 +308,42 @@ def make_pngs(npz_path: str,
         ax.set_xlabel(size_xlabel)
         ax.set_ylabel(f'{size_symbol} · N(>{size_symbol})')
     else:
-        # Choose bins: integer-rounded geometric edges for integer sizes; logspace for floats
-        if (np.issubdtype(size.dtype, np.integer)) or np.allclose(size, np.round(size)):
-            r_min = int(max(1, np.nanmin(size)))
-            r_max = int(np.nanmax(size))
-            edges = find_ell_bin_edges(r_min, r_max, n_ell_bins=60)
+        size_pos = np.asarray(size, dtype=np.float64)
+        size_pos = size_pos[np.isfinite(size_pos) & (size_pos > 0)]
+        if size_pos.size == 0:
+            ax.text(0.5, 0.5, "No data", ha='center', va='center')
         else:
-            lo = np.nanmin(size[size > 0]) if np.any(size > 0) else 1.0
-            hi = np.nanmax(size)
-            edges = np.logspace(np.log10(lo), np.log10(hi), 60)
-        counts, _ = np.histogram(size, bins=edges)
-        edges_f = edges.astype(np.float64, copy=False)
-        log_width = np.log(edges_f[1:]) - np.log(edges_f[:-1])
-        # Use float edges for midpoint calculation to avoid int64 overflow on large bins.
-        v_mid = np.sqrt(edges_f[1:] * edges_f[:-1])
-        spectrum = np.divide(v_mid * counts, log_width,
-                             out=np.full_like(counts, np.nan, dtype=np.float64),
-                             where=log_width > 0)
-        ax.step(edges_f[:-1], spectrum, where='post', alpha=0.9)
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_xlabel(size_xlabel)
-        ax.set_ylabel(size_ylabel)
+            lo = float(np.min(size_pos))
+            hi = float(np.max(size_pos))
+            # Choose bins: integer-rounded geometric edges for integer sizes; logspace for floats
+            if np.isclose(lo, hi):
+                edges_f = np.array([lo, lo * (1.0 + 1e-6)], dtype=np.float64)
+            elif (np.issubdtype(size.dtype, np.integer)) or np.allclose(size_pos, np.round(size_pos)):
+                r_min = int(max(1, np.floor(lo)))
+                r_max = int(np.ceil(hi))
+                if r_max <= r_min:
+                    edges_f = np.array([lo, hi], dtype=np.float64)
+                else:
+                    edges_f = find_ell_bin_edges(r_min, r_max, n_ell_bins=60).astype(np.float64, copy=False)
+            else:
+                edges_f = np.logspace(np.log10(lo), np.log10(hi), 60)
+
+            edges_f = np.unique(edges_f[np.isfinite(edges_f)])
+            if edges_f.size < 2:
+                edges_f = np.array([lo, hi if hi > lo else lo * (1.0 + 1e-6)], dtype=np.float64)
+
+            counts, _ = np.histogram(size_pos, bins=edges_f)
+            log_width = np.log(edges_f[1:]) - np.log(edges_f[:-1])
+            # Use float edges for midpoint calculation to avoid int64 overflow on large bins.
+            v_mid = np.sqrt(edges_f[1:] * edges_f[:-1])
+            spectrum = np.divide(v_mid * counts, log_width,
+                                 out=np.full_like(counts, np.nan, dtype=np.float64),
+                                 where=log_width > 0)
+            ax.step(edges_f[:-1], spectrum, where='post', alpha=0.9)
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.set_xlabel(size_xlabel)
+            ax.set_ylabel(size_ylabel)
     fig.savefig(os.path.join(outdir, f"{base}_size_hist.png"), bbox_inches='tight')
     plt.close(fig)
 
