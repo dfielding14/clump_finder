@@ -161,6 +161,55 @@ def _plot_binned_mean(ax, x: np.ndarray, y: np.ndarray, n_bins: int = 50, xlog: 
     ax.plot(centers[m], means[m], color='white', linewidth=1.2, alpha=0.95, zorder=6)
 
 
+def _compute_asphericity(d: dict[str, np.ndarray], n_clumps: int) -> np.ndarray | None:
+    """Compute asphericity A from eigenvalues lambda1>=lambda2>=lambda3.
+
+    Preferred source is principal_axes_lengths (interpreted as axis lengths, so lambda ~ axis^2).
+    Falls back to scale-free eigenvalue ratios built from axis_ratios if needed.
+    """
+    principal_axes = d.get('principal_axes_lengths')
+    if principal_axes is not None:
+        axes = np.asarray(principal_axes, dtype=np.float64)
+        if axes.ndim == 2 and axes.shape[1] >= 3 and axes.shape[0] == n_clumps:
+            axes3 = np.abs(axes[:, :3])
+            finite = np.all(np.isfinite(axes3), axis=1) & np.all(axes3 > 0, axis=1)
+            axes_sorted = np.sort(axes3, axis=1)[:, ::-1]
+            lambdas = axes_sorted ** 2
+            l1 = lambdas[:, 0]
+            l2 = lambdas[:, 1]
+            l3 = lambdas[:, 2]
+            numer = (l1 - l2) ** 2 + (l2 - l3) ** 2 + (l3 - l1) ** 2
+            denom = 2.0 * (l1 + l2 + l3) ** 2
+            out = np.full(n_clumps, np.nan, dtype=np.float64)
+            valid = finite & np.isfinite(numer) & np.isfinite(denom) & (denom > 0)
+            out[valid] = numer[valid] / denom[valid]
+            return out
+        print("[plot_clumps] principal_axes_lengths has unexpected shape; falling back to axis_ratios for asphericity.")
+
+    axis_ratios = d.get('axis_ratios')
+    if axis_ratios is not None:
+        ratios = np.asarray(axis_ratios, dtype=np.float64)
+        if ratios.ndim == 2 and ratios.shape[1] >= 2 and ratios.shape[0] == n_clumps:
+            ba = ratios[:, 0]
+            ca = ratios[:, 1]
+            finite = np.isfinite(ba) & np.isfinite(ca) & (ba > 0) & (ca > 0)
+            # Scale-free fallback eigenvalues proportional to [1, (b/a)^2, (c/a)^2].
+            lambdas = np.stack([np.ones_like(ba), ba ** 2, ca ** 2], axis=1)
+            lambdas = np.sort(lambdas, axis=1)[:, ::-1]
+            l1 = lambdas[:, 0]
+            l2 = lambdas[:, 1]
+            l3 = lambdas[:, 2]
+            numer = (l1 - l2) ** 2 + (l2 - l3) ** 2 + (l3 - l1) ** 2
+            denom = 2.0 * (l1 + l2 + l3) ** 2
+            out = np.full(n_clumps, np.nan, dtype=np.float64)
+            valid = finite & np.isfinite(numer) & np.isfinite(denom) & (denom > 0)
+            out[valid] = numer[valid] / denom[valid]
+            return out
+        print("[plot_clumps] axis_ratios has unexpected shape; cannot compute asphericity.")
+
+    return None
+
+
 def plot_histogram_comparison(primary_path: str, secondary_path: str, outdir: str,
                               use_volume: bool, labels: Optional[Tuple[str, str]] = None) -> None:
     size_primary = _load_size(primary_path, use_volume)
@@ -271,6 +320,22 @@ def make_pngs(npz_path: str,
         shape_metrics_valid = np.asarray(shape_metrics_valid, dtype=bool)
     else:
         shape_metrics_valid = np.ones(size.shape, dtype=bool)
+
+    # Centralized mask handling for Minkowski-derived metrics.
+    minkowski_computed_raw = d.get('minkowski_computed')
+    minkowski_computed_available = False
+    minkowski_computed_mask = np.ones(size.shape, dtype=bool)
+    n_minkowski_total = size.shape[0]
+    n_minkowski_computed = 0
+    if minkowski_computed_raw is not None:
+        mk = np.asarray(minkowski_computed_raw, dtype=bool).reshape(-1)
+        if mk.shape[0] == size.shape[0]:
+            minkowski_computed_available = True
+            minkowski_computed_mask = mk
+            n_minkowski_computed = int(np.sum(minkowski_computed_mask))
+        else:
+            print("[plot_clumps] minkowski_computed length mismatch; ignoring mask for Minkowski/Euler plots.")
+
     if mass_weighted:
         vx_std = d.get('vx_std_massw')
         vy_std = d.get('vy_std_massw')
@@ -509,6 +574,52 @@ def make_pngs(npz_path: str,
         fig.savefig(os.path.join(outdir, f"{base}_axis_ratios_vs_size.png"), bbox_inches='tight')
         plt.close(fig)
 
+        # 8b) Oblateness / Prolateness vs size from principal-axis ratios
+        # O = (b-c)/(a-c), P = (a-b)/(a-c), using a>=b>=c and ratio inputs b/a, c/a.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            denom = 1.0 - ca
+            oblateness = np.divide(ba - ca, denom, out=np.full_like(ca, np.nan), where=denom > 1e-12)
+            prolateness = np.divide(1.0 - ba, denom, out=np.full_like(ca, np.nan), where=denom > 1e-12)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), dpi=150)
+        op_series = [
+            (r'Oblateness $O=(b-c)/(a-c)$', oblateness),
+            (r'Prolateness $P=(a-b)/(a-c)$', prolateness),
+        ]
+        for ax, (ylabel, metric) in zip(axes, op_series):
+            mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & shape_metrics_valid
+            mask = mask & (metric >= 0) & (metric <= 1)
+            x = size[mask]
+            y = metric[mask]
+            if x.size > 0:
+                _hist2d(ax, x, y, bins=80, xlog=True, ylog=False, xlabel='cell_count', ylabel=ylabel)
+                _plot_binned_mean(ax, x, y, n_bins=50, xlog=True)
+                ax.set_ylim(0, 1)
+            else:
+                ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{base}_oblate_prolate_vs_size.png"), bbox_inches='tight')
+        plt.close(fig)
+
+    # 8c) Asphericity vs size
+    asphericity = _compute_asphericity(d, size.shape[0])
+    if asphericity is not None:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+        mask = np.isfinite(size) & np.isfinite(asphericity) & (size > 0) & shape_metrics_valid
+        mask = mask & (asphericity >= 0) & (asphericity <= 1)
+        x = size[mask]
+        y = asphericity[mask]
+        if x.size > 0:
+            _hist2d(ax, x, y, bins=80, xlog=True, ylog=False, xlabel='cell_count',
+                    ylabel=r'Asphericity $A$')
+            _plot_binned_mean(ax, x, y, n_bins=50, xlog=True)
+            ax.set_ylim(0, 1)
+        else:
+            ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{base}_asphericity_vs_size.png"), bbox_inches='tight')
+        plt.close(fig)
+
     # 9) Minkowski shapefinders vs size
     # Only plot if we have the shapefinder data (computed for interior clumps)
     minkowski_metrics = [
@@ -520,17 +631,14 @@ def make_pngs(npz_path: str,
     ]
     has_minkowski = any(d.get(m[0]) is not None for m in minkowski_metrics)
     if has_minkowski:
-        # Check how many clumps have valid Minkowski data
-        minkowski_computed = d.get('minkowski_computed')
-        if minkowski_computed is not None:
-            minkowski_computed = np.asarray(minkowski_computed, dtype=bool)
-            n_computed = minkowski_computed.sum()
-            n_total = minkowski_computed.shape[0]
+        if minkowski_computed_available:
+            n_computed = n_minkowski_computed
+            n_total = n_minkowski_total
         else:
-            # Fallback: count finite thickness values
+            # Fallback: count finite thickness values.
             thickness = d.get('thickness')
             if thickness is not None:
-                n_computed = np.isfinite(thickness).sum()
+                n_computed = int(np.isfinite(thickness).sum())
                 n_total = thickness.shape[0]
             else:
                 n_computed, n_total = 0, 0
@@ -548,12 +656,13 @@ def make_pngs(npz_path: str,
                     mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & (metric > 0)
                 else:
                     mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & (metric >= 0) & (metric <= 1)
-                if minkowski_computed is not None:
-                    mask = mask & minkowski_computed
+                if minkowski_computed_available:
+                    mask = mask & minkowski_computed_mask
                 x = size[mask]
                 y = metric[mask]
                 if x.size > 10:
                     _hist2d(ax, x, y, bins=60, xlog=True, ylog=use_log, xlabel='cell_count', ylabel=label)
+                    _plot_binned_mean(ax, x, y, n_bins=50, xlog=True)
                     if not use_log:
                         ax.set_ylim(0, 1)
                 else:
@@ -563,7 +672,14 @@ def make_pngs(npz_path: str,
             euler = d.get('euler_characteristic')
             ax = axes[5]
             if euler is not None:
-                euler_finite = euler[np.isfinite(euler)]
+                euler_finite = np.asarray(euler, dtype=np.float64)
+                if euler_finite.shape[0] == size.shape[0]:
+                    mask = np.isfinite(euler_finite)
+                    if minkowski_computed_available:
+                        mask = mask & minkowski_computed_mask
+                    euler_finite = euler_finite[mask]
+                else:
+                    euler_finite = euler_finite[np.isfinite(euler_finite)]
                 if euler_finite.size > 10:
                     # Clip to percentile range to avoid outliers dominating the view
                     p1, p99 = np.percentile(euler_finite, [1, 99])
@@ -590,14 +706,47 @@ def make_pngs(npz_path: str,
             fig.savefig(os.path.join(outdir, f"{base}_minkowski_vs_size.png"), bbox_inches='tight')
             plt.close(fig)
 
-    # 10) Planarity-Filamentarity (P-F) diagram
+    # 10) Euler characteristic vs size
+    euler = d.get('euler_characteristic')
+    if euler is not None:
+        euler = np.asarray(euler, dtype=np.float64)
+        if euler.shape[0] == size.shape[0]:
+            mask = np.isfinite(size) & np.isfinite(euler) & (size > 0)
+            if minkowski_computed_available:
+                mask = mask & minkowski_computed_mask
+            x = size[mask]
+            y = euler[mask]
+            if x.size > 10:
+                p1, p99 = np.percentile(y, [1, 99])
+                ymin = min(p1, -2.0)
+                ymax = max(p99, 3.0)
+                in_view = (y >= ymin) & (y <= ymax)
+                xv = x[in_view]
+                yv = y[in_view]
+                fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+                if xv.size > 0:
+                    _hist2d(ax, xv, yv, bins=80, xlog=True, ylog=False, xlabel='cell_count',
+                            ylabel='Euler characteristic χ')
+                    _plot_binned_mean(ax, xv, yv, n_bins=50, xlog=True)
+                else:
+                    ax.text(0.5, 0.5, "No data", ha='center', va='center')
+                ax.set_ylim(ymin, ymax)
+                ax.axhline(1.0, color='red', linestyle='--', alpha=0.7)
+                ax.axhline(0.0, color='orange', linestyle='--', alpha=0.7)
+                fig.tight_layout()
+                fig.savefig(os.path.join(outdir, f"{base}_euler_vs_size.png"), bbox_inches='tight')
+                plt.close(fig)
+        else:
+            print("[plot_clumps] euler_characteristic length mismatch; skipping euler_vs_size plot.")
+
+    # 11) Planarity-Filamentarity (P-F) diagram
     planarity = d.get('planarity')
     filamentarity = d.get('filamentarity')
     if planarity is not None and filamentarity is not None:
         mask = np.isfinite(planarity) & np.isfinite(filamentarity)
         mask = mask & (planarity >= 0) & (planarity <= 1) & (filamentarity >= 0) & (filamentarity <= 1)
-        if 'minkowski_computed' in d:
-            mask = mask & np.asarray(d['minkowski_computed'], dtype=bool)
+        if minkowski_computed_available:
+            mask = mask & minkowski_computed_mask
         P = planarity[mask]
         F = filamentarity[mask]
         if P.size > 10:
@@ -615,12 +764,12 @@ def make_pngs(npz_path: str,
             fig.savefig(os.path.join(outdir, f"{base}_PF_diagram.png"), bbox_inches='tight')
             plt.close(fig)
 
-    # 11) Integrated curvature vs size
+    # 12) Integrated curvature vs size
     curvature = d.get('integrated_curvature')
     if curvature is not None:
         mask = np.isfinite(size) & np.isfinite(curvature) & (size > 0) & (curvature > 0)
-        if 'minkowski_computed' in d:
-            mask = mask & np.asarray(d['minkowski_computed'], dtype=bool)
+        if minkowski_computed_available:
+            mask = mask & minkowski_computed_mask
         x = size[mask]
         y = curvature[mask]
         if x.size > 10:
