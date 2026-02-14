@@ -32,8 +32,6 @@ def _hist_log(ax, data, bins=50, label=None, xlabel=None, ylabel=None):
         ax.set_xlabel(xlabel)
     if ylabel:
         ax.set_ylabel(ylabel)
-    if label:
-        ax.set_title(label)
 
 
 def _hist2d(ax, x, y, bins=100, xlog=True, ylog=True, xlabel=None, ylabel=None, xedges=None):
@@ -97,10 +95,77 @@ def _load_size(npz_path: str, use_volume: bool) -> np.ndarray:
     return arr[mask]
 
 
+def _size_axis_labels(use_volume: bool) -> tuple[str, str, str, str]:
+    if use_volume:
+        return "V", "V [Δx^3]", "V · dN / dlog V", "volume"
+    return "N_cell", "cell count", "N_cell · dN / dlog N_cell", "cell_count"
+
+
+def _compensated_cumulative(values: np.ndarray, n_points: int = 300) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    vals = np.asarray(values, dtype=np.float64)
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size == 0:
+        return None, None
+    vmin = float(np.min(vals))
+    vmax = float(np.max(vals))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin <= 0 or vmax <= 0:
+        return None, None
+    if np.isclose(vmin, vmax):
+        thresholds = np.array([vmin], dtype=np.float64)
+        compensated = np.array([vmin * vals.size], dtype=np.float64)
+        return thresholds, compensated
+    thresholds = np.logspace(np.log10(vmin), np.log10(vmax), n_points)
+    sorted_vals = np.sort(vals)
+    counts = sorted_vals.size - np.searchsorted(sorted_vals, thresholds, side="left")
+    compensated = thresholds * counts.astype(np.float64)
+    return thresholds, compensated
+
+
+def _plot_binned_mean(ax, x: np.ndarray, y: np.ndarray, n_bins: int = 50, xlog: bool = True) -> None:
+    """Overlay mean(y) in bins of x."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if xlog:
+        mask = mask & (x > 0)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 2:
+        return
+
+    xmin = np.min(x)
+    xmax = np.max(x)
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or np.isclose(xmin, xmax):
+        return
+
+    if xlog:
+        edges = np.logspace(np.log10(xmin), np.log10(xmax), n_bins + 1)
+        centers = np.sqrt(edges[:-1] * edges[1:])
+    else:
+        edges = np.linspace(xmin, xmax, n_bins + 1)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+
+    bin_idx = np.digitize(x, edges) - 1
+    valid = (bin_idx >= 0) & (bin_idx < n_bins)
+    if not np.any(valid):
+        return
+
+    sums = np.bincount(bin_idx[valid], weights=y[valid], minlength=n_bins).astype(np.float64)
+    counts = np.bincount(bin_idx[valid], minlength=n_bins).astype(np.float64)
+    means = np.divide(sums, counts, out=np.full(n_bins, np.nan, dtype=np.float64), where=counts > 0)
+    m = np.isfinite(means)
+    if np.count_nonzero(m) < 2:
+        return
+
+    ax.plot(centers[m], means[m], color='black', linewidth=2.0, alpha=0.9, zorder=5)
+    ax.plot(centers[m], means[m], color='white', linewidth=1.2, alpha=0.95, zorder=6)
+
+
 def plot_histogram_comparison(primary_path: str, secondary_path: str, outdir: str,
                               use_volume: bool, labels: Optional[Tuple[str, str]] = None) -> None:
     size_primary = _load_size(primary_path, use_volume)
     size_secondary = _load_size(secondary_path, use_volume)
+    _, size_xlabel, size_ylabel, sum_label = _size_axis_labels(use_volume)
 
     if size_primary.size == 0 or size_secondary.size == 0:
         print("[plot_clumps] Skipping histogram comparison; one input has no positive sizes.")
@@ -125,7 +190,7 @@ def plot_histogram_comparison(primary_path: str, secondary_path: str, outdir: st
         spec_secondary,
         spec_primary,
         out=np.full_like(hist_secondary, np.nan, dtype=np.float64),
-        where=(spec_primary > 0),
+        where=(spec_primary > 0) & (spec_secondary > 0),
     )
     total_primary = np.sum(size_primary)
     total_secondary = np.sum(size_secondary)
@@ -137,8 +202,8 @@ def plot_histogram_comparison(primary_path: str, secondary_path: str, outdir: st
     else:
         label_primary = base_primary
         label_secondary = base_secondary
-    label_primary = f"{label_primary} (∑ volume = {total_primary:.3e})"
-    label_secondary = f"{label_secondary} (∑ volume = {total_secondary:.3e})"
+    label_primary = f"{label_primary} (∑ {sum_label} = {total_primary:.3e})"
+    label_secondary = f"{label_secondary} (∑ {sum_label} = {total_secondary:.3e})"
 
     centers = bins[:-1]
     fig, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(7, 8), sharex=True, dpi=150)
@@ -147,14 +212,13 @@ def plot_histogram_comparison(primary_path: str, secondary_path: str, outdir: st
     ax_top.step(centers, spec_secondary, where='post', label=label_secondary, color='tab:orange')
     ax_top.set_xscale('log')
     ax_top.set_yscale('log')
-    ax_top.set_ylabel('V · dN / dlog V')
+    ax_top.set_ylabel(size_ylabel)
     ax_top.legend()
-    ax_top.set_title('Clump size histogram comparison')
 
     ax_bottom.step(centers, ratio, where='post', color='tab:purple')
     ax_bottom.axhline(1.0, color='black', linestyle='--', linewidth=1)
     ax_bottom.set_xscale('log')
-    ax_bottom.set_xlabel('V [Δx^3]')
+    ax_bottom.set_xlabel(size_xlabel)
     ax_bottom.set_ylabel('ratio (secondary / primary)')
 
     fig.tight_layout()
@@ -193,9 +257,20 @@ def find_ell_bin_edges(r_min: int, r_max: int, n_ell_bins: int) -> np.ndarray:
     return best
 
 
-def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighted: bool = False, prefix: str | None = None):
+def make_pngs(npz_path: str,
+              outdir: str,
+              use_volume: bool = False,
+              mass_weighted: bool = False,
+              prefix: str | None = None,
+              compensated_cumulative: bool = False):
     d = _load(npz_path)
     size = d['volume'] if use_volume else d['cell_count']
+    _, size_xlabel, size_ylabel, _ = _size_axis_labels(use_volume)
+    shape_metrics_valid = d.get('shape_metrics_valid')
+    if shape_metrics_valid is not None:
+        shape_metrics_valid = np.asarray(shape_metrics_valid, dtype=bool)
+    else:
+        shape_metrics_valid = np.ones(size.shape, dtype=bool)
     if mass_weighted:
         vx_std = d.get('vx_std_massw')
         vy_std = d.get('vy_std_massw')
@@ -218,29 +293,43 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
     os.makedirs(outdir, exist_ok=True)
     base = prefix or (os.path.splitext(os.path.basename(npz_path))[0])
 
-    # 1) Size spectrum: V * dN/dlogV
+    # 1) Size distribution (differential spectrum or compensated cumulative)
     fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
-    # Choose bins: integer-rounded geometric edges for integer sizes; logspace for floats
-    if (np.issubdtype(size.dtype, np.integer)) or np.allclose(size, np.round(size)):
-        r_min = int(max(1, np.nanmin(size)))
-        r_max = int(np.nanmax(size))
-        edges = find_ell_bin_edges(r_min, r_max, n_ell_bins=60)
+    size_symbol = "V" if use_volume else "N_cell"
+    if compensated_cumulative:
+        x, y = _compensated_cumulative(size, n_points=300)
+        if x is None or y is None:
+            ax.text(0.5, 0.5, "No data", ha='center', va='center')
+        else:
+            mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+            ax.plot(x[mask], y[mask], alpha=0.9)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel(size_xlabel)
+        ax.set_ylabel(f'{size_symbol} · N(>{size_symbol})')
     else:
-        lo = np.nanmin(size[size > 0]) if np.any(size > 0) else 1.0
-        hi = np.nanmax(size)
-        edges = np.logspace(np.log10(lo), np.log10(hi), 60)
-    counts, _ = np.histogram(size, bins=edges)
-    log_width = np.log(edges[1:]) - np.log(edges[:-1])
-    v_mid = np.sqrt(edges[1:] * edges[:-1])
-    spectrum = np.divide(v_mid * counts, log_width,
-                         out=np.full_like(counts, np.nan, dtype=np.float64),
-                         where=log_width > 0)
-    ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_xlabel('V [Δx^3]')
-    ax.set_ylabel('V · dN / dlog V')
-    ax.set_title('Clump size spectrum (K={})'.format(size.shape[0]))
+        # Choose bins: integer-rounded geometric edges for integer sizes; logspace for floats
+        if (np.issubdtype(size.dtype, np.integer)) or np.allclose(size, np.round(size)):
+            r_min = int(max(1, np.nanmin(size)))
+            r_max = int(np.nanmax(size))
+            edges = find_ell_bin_edges(r_min, r_max, n_ell_bins=60)
+        else:
+            lo = np.nanmin(size[size > 0]) if np.any(size > 0) else 1.0
+            hi = np.nanmax(size)
+            edges = np.logspace(np.log10(lo), np.log10(hi), 60)
+        counts, _ = np.histogram(size, bins=edges)
+        edges_f = edges.astype(np.float64, copy=False)
+        log_width = np.log(edges_f[1:]) - np.log(edges_f[:-1])
+        # Use float edges for midpoint calculation to avoid int64 overflow on large bins.
+        v_mid = np.sqrt(edges_f[1:] * edges_f[:-1])
+        spectrum = np.divide(v_mid * counts, log_width,
+                             out=np.full_like(counts, np.nan, dtype=np.float64),
+                             where=log_width > 0)
+        ax.step(edges_f[:-1], spectrum, where='post', alpha=0.9)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel(size_xlabel)
+        ax.set_ylabel(size_ylabel)
     fig.savefig(os.path.join(outdir, f"{base}_size_hist.png"), bbox_inches='tight')
     plt.close(fig)
 
@@ -271,59 +360,72 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
                 xedges = np.logspace(np.log10(lo), np.log10(hi), 60)
                 _hist2d(ax, vol, ratio, bins=100, xlog=True, ylog=True,
                         xlabel='clump volume', ylabel='area / volume$^{8/9}$', xedges=xedges)
-        ax.set_title('Normalized area vs volume (8/9 power)')
         fig.savefig(os.path.join(outdir, f"{base}_area_over_vol89_vs_volume.png"), bbox_inches='tight')
         plt.close(fig)
 
     # 4) Velocity dispersion vs volume - REMOVED due to numerical issues
 
-    # 5) Mass spectrum: M * dN/dlogM
+    # 5) Mass distribution (differential spectrum or compensated cumulative)
     mass = d.get('mass')
     if mass is not None:
         fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
         mass_pos = mass[np.isfinite(mass) & (mass > 0)]
         if mass_pos.size > 0:
-            lo = np.nanmin(mass_pos)
-            hi = np.nanmax(mass_pos)
-            edges = np.logspace(np.log10(lo), np.log10(hi), 60)
-            counts, _ = np.histogram(mass_pos, bins=edges)
-            log_width = np.log(edges[1:]) - np.log(edges[:-1])
-            m_mid = np.sqrt(edges[1:] * edges[:-1])
-            spectrum = np.divide(m_mid * counts, log_width,
-                                 out=np.full_like(counts, np.nan, dtype=np.float64),
-                                 where=log_width > 0)
-            ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
+            if compensated_cumulative:
+                x, y = _compensated_cumulative(mass_pos, n_points=300)
+                mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                ax.plot(x[mask], y[mask], alpha=0.9)
+            else:
+                lo = np.nanmin(mass_pos)
+                hi = np.nanmax(mass_pos)
+                edges = np.logspace(np.log10(lo), np.log10(hi), 60)
+                counts, _ = np.histogram(mass_pos, bins=edges)
+                log_width = np.log(edges[1:]) - np.log(edges[:-1])
+                m_mid = np.sqrt(edges[1:] * edges[:-1])
+                spectrum = np.divide(m_mid * counts, log_width,
+                                     out=np.full_like(counts, np.nan, dtype=np.float64),
+                                     where=log_width > 0)
+                ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
             ax.set_xscale('log')
             ax.set_yscale('log')
             ax.set_xlabel('M [code units]')
-            ax.set_ylabel('M · dN / dlog M')
-            ax.set_title('Clump mass spectrum')
+            if compensated_cumulative:
+                ax.set_ylabel('M · N(>M)')
+            else:
+                ax.set_ylabel('M · dN / dlog M')
         else:
             ax.text(0.5, 0.5, "No mass data", ha='center', va='center')
         fig.savefig(os.path.join(outdir, f"{base}_mass_spectrum.png"), bbox_inches='tight')
         plt.close(fig)
 
-    # 6) Surface area spectrum: A * dN/dlogA
+    # 6) Surface area distribution (differential spectrum or compensated cumulative)
     area = d.get('area')
     if area is not None:
         fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
         area_pos = area[np.isfinite(area) & (area > 0)]
         if area_pos.size > 0:
-            lo = np.nanmin(area_pos)
-            hi = np.nanmax(area_pos)
-            edges = np.logspace(np.log10(lo), np.log10(hi), 60)
-            counts, _ = np.histogram(area_pos, bins=edges)
-            log_width = np.log(edges[1:]) - np.log(edges[:-1])
-            a_mid = np.sqrt(edges[1:] * edges[:-1])
-            spectrum = np.divide(a_mid * counts, log_width,
-                                 out=np.full_like(counts, np.nan, dtype=np.float64),
-                                 where=log_width > 0)
-            ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
+            if compensated_cumulative:
+                x, y = _compensated_cumulative(area_pos, n_points=300)
+                mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                ax.plot(x[mask], y[mask], alpha=0.9)
+            else:
+                lo = np.nanmin(area_pos)
+                hi = np.nanmax(area_pos)
+                edges = np.logspace(np.log10(lo), np.log10(hi), 60)
+                counts, _ = np.histogram(area_pos, bins=edges)
+                log_width = np.log(edges[1:]) - np.log(edges[:-1])
+                a_mid = np.sqrt(edges[1:] * edges[:-1])
+                spectrum = np.divide(a_mid * counts, log_width,
+                                     out=np.full_like(counts, np.nan, dtype=np.float64),
+                                     where=log_width > 0)
+                ax.step(edges[:-1], spectrum, where='post', alpha=0.9)
             ax.set_xscale('log')
             ax.set_yscale('log')
             ax.set_xlabel('A [Δx^2]')
-            ax.set_ylabel('A · dN / dlog A')
-            ax.set_title('Clump surface area spectrum')
+            if compensated_cumulative:
+                ax.set_ylabel('A · N(>A)')
+            else:
+                ax.set_ylabel('A · dN / dlog A')
         else:
             ax.text(0.5, 0.5, "No area data", ha='center', va='center')
         fig.savefig(os.path.join(outdir, f"{base}_area_spectrum.png"), bbox_inches='tight')
@@ -331,10 +433,10 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
 
     # 7) Shape metrics vs size (sphericity, compactness, triaxiality, elongation)
     shape_metrics = [
-        ('sphericity', 'Sphericity', (0, 1)),
-        ('compactness', 'Compactness', (0, 1)),
-        ('triaxiality', 'Triaxiality T', (0, 1)),
-        ('elongation', 'Elongation', (1, 1e3)),  # reasonable range for axis ratio
+        ('sphericity', r'Sphericity $\Phi=\pi^{1/3}(6V)^{2/3}/A$', (0, 1)),
+        ('compactness', r'Compactness $C=36\pi V^2/A^3$', (0, 1)),
+        ('triaxiality', r'Triaxiality $T=(a^2-b^2)/(a^2-c^2)$', (0, 1)),
+        ('elongation', r'Elongation $E=a/c$', (1, 1e3)),  # reasonable range for axis ratio
     ]
     has_shape = any(d.get(m[0]) is not None for m in shape_metrics)
     if has_shape:
@@ -344,45 +446,51 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
             metric = d.get(key)
             if metric is None:
                 ax.text(0.5, 0.5, f"No {key} data", ha='center', va='center', transform=ax.transAxes)
-                ax.set_title(f'{label} vs Size')
                 continue
             # For elongation, use log scale and filter reasonable values
             is_elongation = (key == 'elongation')
-            if is_elongation:
-                mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & (metric > 0) & (metric < 1e6)
-            else:
-                mask = np.isfinite(size) & np.isfinite(metric) & (size > 0)
+            mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & shape_metrics_valid
+            if key in ('sphericity', 'compactness', 'triaxiality'):
+                mask = mask & (metric >= 0) & (metric <= 1)
+            elif is_elongation:
+                mask = mask & (metric >= 1) & (metric < 1e6)
             x = size[mask]
             y = metric[mask]
             if x.size > 0:
                 _hist2d(ax, x, y, bins=80, xlog=True, ylog=is_elongation, xlabel='cell_count', ylabel=label)
+                _plot_binned_mean(ax, x, y, n_bins=50, xlog=True)
                 if ylim and not is_elongation:
                     ax.set_ylim(ylim)
             else:
                 ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f'{label} vs Size')
-        fig.suptitle('Shape metrics vs clump size', y=1.02)
         fig.tight_layout()
         fig.savefig(os.path.join(outdir, f"{base}_shape_vs_size.png"), bbox_inches='tight')
         plt.close(fig)
 
-    # 8) Axis ratios vs size (b/a and c/a)
+    # 8) Axis ratios vs size (b/a, c/a, and c/b)
     axis_ratios = d.get('axis_ratios')
     if axis_ratios is not None and axis_ratios.ndim == 2 and axis_ratios.shape[1] >= 2:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4), dpi=150)
-        ratio_labels = [('b/a (intermediate/major)', 0), ('c/a (minor/major)', 1)]
-        for ax, (rlabel, idx) in zip(axes, ratio_labels):
-            ratio = axis_ratios[:, idx]
-            mask = np.isfinite(size) & np.isfinite(ratio) & (size > 0) & (ratio > 0)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4), dpi=150)
+        ba = np.asarray(axis_ratios[:, 0], dtype=np.float64)
+        ca = np.asarray(axis_ratios[:, 1], dtype=np.float64)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cb = np.divide(ca, ba, out=np.full_like(ca, np.nan), where=ba > 0)
+        ratio_series = [
+            ('b/a (intermediate/major)', ba),
+            ('c/a (minor/major)', ca),
+            ('c/b (minor/intermediate)', cb),
+        ]
+        for ax, (rlabel, ratio) in zip(axes, ratio_series):
+            mask = np.isfinite(size) & np.isfinite(ratio) & (size > 0) & shape_metrics_valid
+            mask = mask & (ratio > 0) & (ratio <= 1)
             x = size[mask]
             y = ratio[mask]
             if x.size > 0:
                 _hist2d(ax, x, y, bins=80, xlog=True, ylog=False, xlabel='cell_count', ylabel=rlabel)
+                _plot_binned_mean(ax, x, y, n_bins=50, xlog=True)
                 ax.set_ylim(0, 1)
             else:
                 ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f'{rlabel} vs Size')
-        fig.suptitle('Axis ratios vs clump size', y=1.02)
         fig.tight_layout()
         fig.savefig(os.path.join(outdir, f"{base}_axis_ratios_vs_size.png"), bbox_inches='tight')
         plt.close(fig)
@@ -401,6 +509,7 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
         # Check how many clumps have valid Minkowski data
         minkowski_computed = d.get('minkowski_computed')
         if minkowski_computed is not None:
+            minkowski_computed = np.asarray(minkowski_computed, dtype=bool)
             n_computed = minkowski_computed.sum()
             n_total = minkowski_computed.shape[0]
         else:
@@ -420,12 +529,13 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
                 metric = d.get(key)
                 if metric is None:
                     ax.text(0.5, 0.5, f"No {key} data", ha='center', va='center', transform=ax.transAxes)
-                    ax.set_title(f'{label} vs Size')
                     continue
                 if use_log:
                     mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & (metric > 0)
                 else:
-                    mask = np.isfinite(size) & np.isfinite(metric) & (size > 0)
+                    mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & (metric >= 0) & (metric <= 1)
+                if minkowski_computed is not None:
+                    mask = mask & minkowski_computed
                 x = size[mask]
                 y = metric[mask]
                 if x.size > 10:
@@ -434,7 +544,6 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
                         ax.set_ylim(0, 1)
                 else:
                     ax.text(0.5, 0.5, f"Insufficient data\n({x.size} points)", ha='center', va='center', transform=ax.transAxes)
-                ax.set_title(f'{label} vs Size')
 
             # 6th panel: Euler characteristic histogram
             euler = d.get('euler_characteristic')
@@ -463,9 +572,6 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
                     ax.text(0.5, 0.5, "Insufficient Euler data", ha='center', va='center', transform=ax.transAxes)
             else:
                 ax.text(0.5, 0.5, "No Euler data", ha='center', va='center', transform=ax.transAxes)
-            ax.set_title('Euler characteristic distribution')
-
-            fig.suptitle(f'Minkowski shapefinders ({n_computed:,} / {n_total:,} clumps computed)', y=1.02)
             fig.tight_layout()
             fig.savefig(os.path.join(outdir, f"{base}_minkowski_vs_size.png"), bbox_inches='tight')
             plt.close(fig)
@@ -475,6 +581,9 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
     filamentarity = d.get('filamentarity')
     if planarity is not None and filamentarity is not None:
         mask = np.isfinite(planarity) & np.isfinite(filamentarity)
+        mask = mask & (planarity >= 0) & (planarity <= 1) & (filamentarity >= 0) & (filamentarity <= 1)
+        if 'minkowski_computed' in d:
+            mask = mask & np.asarray(d['minkowski_computed'], dtype=bool)
         P = planarity[mask]
         F = filamentarity[mask]
         if P.size > 10:
@@ -487,7 +596,6 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
             ax.plot(1, 0, 'g^', markersize=10, label='Pancake (P=1, F=0)')
             ax.plot(0, 1, 'bs', markersize=10, label='Filament (P=0, F=1)')
             ax.legend(loc='upper right', fontsize=8)
-            ax.set_title(f'P-F diagram ({P.size:,} clumps)')
             ax.set_aspect('equal')
             fig.tight_layout()
             fig.savefig(os.path.join(outdir, f"{base}_PF_diagram.png"), bbox_inches='tight')
@@ -497,12 +605,13 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
     curvature = d.get('integrated_curvature')
     if curvature is not None:
         mask = np.isfinite(size) & np.isfinite(curvature) & (size > 0) & (curvature > 0)
+        if 'minkowski_computed' in d:
+            mask = mask & np.asarray(d['minkowski_computed'], dtype=bool)
         x = size[mask]
         y = curvature[mask]
         if x.size > 10:
             fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
             _hist2d(ax, x, y, bins=60, xlog=True, ylog=True, xlabel='cell_count', ylabel='Integrated curvature C')
-            ax.set_title(f'Integrated curvature vs size ({x.size:,} clumps)')
             fig.tight_layout()
             fig.savefig(os.path.join(outdir, f"{base}_curvature_vs_size.png"), bbox_inches='tight')
             plt.close(fig)
@@ -523,10 +632,19 @@ def main():
                     help='legend labels for --compare (defaults to basenames)')
     ap.add_argument('--compare-outdir', default=None,
                     help='output directory for comparison plot (defaults to --outdir)')
+    ap.add_argument('--compensated-cumulative', action='store_true',
+                    help='use compensated cumulative distributions for size/mass/area panels')
     args = ap.parse_args()
 
     outdir = args.outdir or os.path.dirname(args.input) or '.'
-    make_pngs(args.input, outdir, use_volume=args.use_volume, mass_weighted=args.mass_weighted, prefix=args.prefix)
+    make_pngs(
+        args.input,
+        outdir,
+        use_volume=args.use_volume,
+        mass_weighted=args.mass_weighted,
+        prefix=args.prefix,
+        compensated_cumulative=args.compensated_cumulative,
+    )
 
     if args.compare:
         compare_outdir = args.compare_outdir or outdir
