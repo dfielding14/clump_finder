@@ -380,9 +380,44 @@ def run_single_config(N, beta, anisotropy, temp_threshold, connectivity, outdir,
         order = np.argsort(vals)[::-1]
         vals = vals[order]
         vecs = vecs[:, order]
-        a = np.sqrt(max(vals[0], 0.0))
-        b = np.sqrt(max(vals[1], 0.0))
-        c = np.sqrt(max(vals[2], 0.0))
+        # Raw RMS extents from eigenvalues
+        a_raw = np.sqrt(max(vals[0], 0.0))
+        b_raw = np.sqrt(max(vals[1], 0.0))
+        c_raw = np.sqrt(max(vals[2], 0.0))
+
+        V_clump = vol[idx]
+        # Minimum axis length: half a voxel (cells have finite extent)
+        axis_min = 0.5 * (dx + dy + dz) / 3.0
+
+        # For degenerate cases (point-like clumps with no spatial extent),
+        # use cube approximation: a = b = c = V^(1/3)
+        if a_raw < 1e-10 or V_clump <= 0:
+            side = V_clump ** (1.0 / 3.0) if V_clump > 0 else 0.0
+            a, b, c = side, side, side
+        else:
+            # Normalize so a*b*c = V while preserving shape ratios
+            abc_raw = a_raw * b_raw * c_raw
+            if abc_raw > 1e-30:
+                scale = (V_clump / abc_raw) ** (1.0 / 3.0)
+                a = a_raw * scale
+                b = b_raw * scale
+                c = c_raw * scale
+            else:
+                # Near-degenerate (very thin filament): use cube approximation
+                side = V_clump ** (1.0 / 3.0)
+                a, b, c = side, side, side
+
+        # Enforce minimum b,c based on finite cell size, then recalculate a
+        # to preserve volume. This prevents unphysical elongation for thin
+        # filaments where covariance eigenvalues approach zero.
+        if c < axis_min:
+            c = axis_min
+        if b < axis_min:
+            b = axis_min
+        # Recalculate a to preserve a*b*c = V
+        if b * c > 0:
+            a = V_clump / (b * c)
+
         principal_axes_lengths[idx, :] = (a, b, c)
         axis_ratios[idx, :] = (b / (a + 1e-300), c / (a + 1e-300))
         orientation[idx, :, :] = vecs
@@ -394,10 +429,8 @@ def run_single_config(N, beta, anisotropy, temp_threshold, connectivity, outdir,
         else:
             triaxiality[idx] = 0.5  # degenerate case
 
-        # Elongation: a/c (with sensible minimum for c to avoid huge values)
-        # Use at least 1% of a as minimum c to avoid numerical issues
-        c_safe = max(c, 0.01 * a, 1e-6 * dx)
-        elongation[idx] = a / c_safe
+        # Elongation: a/c (axes already bounded by cell size)
+        elongation[idx] = a / (c + 1e-300)
 
     bbox_ijk = M.compute_bboxes(labels, ((0, N), (0, N), (0, N)), K=K)
 

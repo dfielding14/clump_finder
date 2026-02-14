@@ -247,8 +247,8 @@ def stitch_reduce(input_dir: str, output_path: str):
         stitched_count[root_to_idx[roots[g]]] += 1
     is_stitched = stitched_count > 1  # True if clump spans multiple ranks
 
-    # Check if extra stats are available
-    has_extra_stats = "vx_mean" in any_npz
+    # Check if extra stats are available (velocity moments OR covariance data)
+    has_extra_stats = "vx_mean" in any_npz or "cov_W" in any_npz
 
     cell_count = np.zeros(G, dtype=np.int64)
     volume = np.zeros(G, dtype=np.float64)
@@ -456,9 +456,44 @@ def stitch_reduce(input_dir: str, output_path: str):
                 vals = np.array([Cxx[i], Cyy[i], Czz[i]])
                 vals = np.sort(vals)[::-1]
 
-            a = np.sqrt(max(vals[0], 0.0))
-            b = np.sqrt(max(vals[1], 0.0))
-            c = np.sqrt(max(vals[2], 0.0))
+            # Raw RMS extents from eigenvalues
+            a_raw = np.sqrt(max(vals[0], 0.0))
+            b_raw = np.sqrt(max(vals[1], 0.0))
+            c_raw = np.sqrt(max(vals[2], 0.0))
+
+            V_clump = volume[i]
+            # Minimum axis length: half a voxel (cells have finite extent)
+            axis_min = 0.5 * (dx + dy + dz) / 3.0
+
+            # For degenerate cases (point-like clumps with no spatial extent),
+            # use cube approximation: a = b = c = V^(1/3)
+            if a_raw < 1e-10 or V_clump <= 0:
+                side = V_clump ** (1.0 / 3.0) if V_clump > 0 else 0.0
+                a, b, c = side, side, side
+            else:
+                # Normalize so a*b*c = V while preserving shape ratios
+                abc_raw = a_raw * b_raw * c_raw
+                if abc_raw > 1e-30:
+                    scale = (V_clump / abc_raw) ** (1.0 / 3.0)
+                    a = a_raw * scale
+                    b = b_raw * scale
+                    c = c_raw * scale
+                else:
+                    # Near-degenerate (very thin filament): use cube approximation
+                    side = V_clump ** (1.0 / 3.0)
+                    a, b, c = side, side, side
+
+            # Enforce minimum b,c based on finite cell size, then recalculate a
+            # to preserve volume. This prevents unphysical elongation for thin
+            # filaments where covariance eigenvalues approach zero.
+            if c < axis_min:
+                c = axis_min
+            if b < axis_min:
+                b = axis_min
+            # Recalculate a to preserve a*b*c = V
+            if b * c > 0:
+                a = V_clump / (b * c)
+
             principal_axes_lengths[i] = (a, b, c)
             axis_ratios[i] = (b / (a + small), c / (a + small))
 
@@ -479,6 +514,7 @@ def stitch_reduce(input_dir: str, output_path: str):
         b = principal_axes_lengths[:, 1]
         c = principal_axes_lengths[:, 2]
         triaxiality = (a**2 - b**2) / (a**2 - c**2 + small)
+        # Elongation: axes already have minimum bounds from cell size constraint
         elongation = a / (c + small)
 
         out["r_eff"] = r_eff

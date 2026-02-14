@@ -387,10 +387,125 @@ def make_pngs(npz_path: str, outdir: str, use_volume: bool = False, mass_weighte
         fig.savefig(os.path.join(outdir, f"{base}_axis_ratios_vs_size.png"), bbox_inches='tight')
         plt.close(fig)
 
-    # 9) Minkowski functionals - REMOVED
-    # Minkowski shapefinder values computed in stitcher are unreliable because:
-    # - Euler characteristic isn't additive across stitched fragments
-    # - Integrated curvature requires voxel-level boundary information not preserved through stitching
+    # 9) Minkowski shapefinders vs size
+    # Only plot if we have the shapefinder data (computed for interior clumps)
+    minkowski_metrics = [
+        ('thickness', 'Thickness T', True),   # log scale
+        ('breadth', 'Breadth B', True),       # log scale
+        ('length', 'Length L', True),         # log scale
+        ('planarity', 'Planarity P', False),  # linear 0-1
+        ('filamentarity', 'Filamentarity F', False),  # linear 0-1
+    ]
+    has_minkowski = any(d.get(m[0]) is not None for m in minkowski_metrics)
+    if has_minkowski:
+        # Check how many clumps have valid Minkowski data
+        minkowski_computed = d.get('minkowski_computed')
+        if minkowski_computed is not None:
+            n_computed = minkowski_computed.sum()
+            n_total = minkowski_computed.shape[0]
+        else:
+            # Fallback: count finite thickness values
+            thickness = d.get('thickness')
+            if thickness is not None:
+                n_computed = np.isfinite(thickness).sum()
+                n_total = thickness.shape[0]
+            else:
+                n_computed, n_total = 0, 0
+
+        if n_computed > 10:  # Only plot if we have enough data
+            fig, axes = plt.subplots(2, 3, figsize=(14, 8), dpi=150)
+            axes = axes.flatten()
+
+            for ax, (key, label, use_log) in zip(axes[:5], minkowski_metrics):
+                metric = d.get(key)
+                if metric is None:
+                    ax.text(0.5, 0.5, f"No {key} data", ha='center', va='center', transform=ax.transAxes)
+                    ax.set_title(f'{label} vs Size')
+                    continue
+                if use_log:
+                    mask = np.isfinite(size) & np.isfinite(metric) & (size > 0) & (metric > 0)
+                else:
+                    mask = np.isfinite(size) & np.isfinite(metric) & (size > 0)
+                x = size[mask]
+                y = metric[mask]
+                if x.size > 10:
+                    _hist2d(ax, x, y, bins=60, xlog=True, ylog=use_log, xlabel='cell_count', ylabel=label)
+                    if not use_log:
+                        ax.set_ylim(0, 1)
+                else:
+                    ax.text(0.5, 0.5, f"Insufficient data\n({x.size} points)", ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'{label} vs Size')
+
+            # 6th panel: Euler characteristic histogram
+            euler = d.get('euler_characteristic')
+            ax = axes[5]
+            if euler is not None:
+                euler_finite = euler[np.isfinite(euler)]
+                if euler_finite.size > 10:
+                    # Clip to percentile range to avoid outliers dominating the view
+                    p1, p99 = np.percentile(euler_finite, [1, 99])
+                    # Ensure we include χ=1 (sphere) and χ=0 (torus) reference lines
+                    xmin = min(p1, -2)
+                    xmax = max(p99, 3)
+                    euler_clipped = euler_finite[(euler_finite >= xmin) & (euler_finite <= xmax)]
+                    n_clipped = euler_finite.size - euler_clipped.size
+                    ax.hist(euler_clipped, bins=np.arange(xmin, xmax + 1, 1), histtype='stepfilled',
+                            alpha=0.85, edgecolor='black', linewidth=0.5)
+                    ax.set_xlabel('Euler characteristic χ')
+                    ax.set_ylabel('Count')
+                    ax.axvline(1, color='red', linestyle='--', alpha=0.7, label='χ=1 (sphere)')
+                    ax.axvline(0, color='orange', linestyle='--', alpha=0.7, label='χ=0 (torus)')
+                    ax.legend(fontsize=8)
+                    if n_clipped > 0:
+                        ax.text(0.98, 0.98, f'{n_clipped:,} outliers clipped', fontsize=7,
+                                ha='right', va='top', transform=ax.transAxes)
+                else:
+                    ax.text(0.5, 0.5, "Insufficient Euler data", ha='center', va='center', transform=ax.transAxes)
+            else:
+                ax.text(0.5, 0.5, "No Euler data", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Euler characteristic distribution')
+
+            fig.suptitle(f'Minkowski shapefinders ({n_computed:,} / {n_total:,} clumps computed)', y=1.02)
+            fig.tight_layout()
+            fig.savefig(os.path.join(outdir, f"{base}_minkowski_vs_size.png"), bbox_inches='tight')
+            plt.close(fig)
+
+    # 10) Planarity-Filamentarity (P-F) diagram
+    planarity = d.get('planarity')
+    filamentarity = d.get('filamentarity')
+    if planarity is not None and filamentarity is not None:
+        mask = np.isfinite(planarity) & np.isfinite(filamentarity)
+        P = planarity[mask]
+        F = filamentarity[mask]
+        if P.size > 10:
+            fig, ax = plt.subplots(figsize=(7, 6), dpi=150)
+            _hist2d(ax, P, F, bins=60, xlog=False, ylog=False, xlabel='Planarity P', ylabel='Filamentarity F')
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            # Add reference points
+            ax.plot(0, 0, 'r*', markersize=12, label='Sphere (P=0, F=0)')
+            ax.plot(1, 0, 'g^', markersize=10, label='Pancake (P=1, F=0)')
+            ax.plot(0, 1, 'bs', markersize=10, label='Filament (P=0, F=1)')
+            ax.legend(loc='upper right', fontsize=8)
+            ax.set_title(f'P-F diagram ({P.size:,} clumps)')
+            ax.set_aspect('equal')
+            fig.tight_layout()
+            fig.savefig(os.path.join(outdir, f"{base}_PF_diagram.png"), bbox_inches='tight')
+            plt.close(fig)
+
+    # 11) Integrated curvature vs size
+    curvature = d.get('integrated_curvature')
+    if curvature is not None:
+        mask = np.isfinite(size) & np.isfinite(curvature) & (size > 0) & (curvature > 0)
+        x = size[mask]
+        y = curvature[mask]
+        if x.size > 10:
+            fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+            _hist2d(ax, x, y, bins=60, xlog=True, ylog=True, xlabel='cell_count', ylabel='Integrated curvature C')
+            ax.set_title(f'Integrated curvature vs size ({x.size:,} clumps)')
+            fig.tight_layout()
+            fig.savefig(os.path.join(outdir, f"{base}_curvature_vs_size.png"), bbox_inches='tight')
+            plt.close(fig)
 
     print(f"Wrote PNGs to {outdir}")
 
@@ -399,6 +514,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', required=True, help='path to per-node or master npz')
     ap.add_argument('--outdir', default=None, help='output directory for PNGs (default next to input)')
+    ap.add_argument('--prefix', default=None, help='prefix for output filenames (default: input basename)')
     ap.add_argument('--use-volume', action='store_true', help='use volume as clump size (default cell_count)')
     ap.add_argument('--mass-weighted', action='store_true', help='use mass-weighted stds')
     ap.add_argument('--compare', default=None,
@@ -410,7 +526,7 @@ def main():
     args = ap.parse_args()
 
     outdir = args.outdir or os.path.dirname(args.input) or '.'
-    make_pngs(args.input, outdir, use_volume=args.use_volume, mass_weighted=args.mass_weighted)
+    make_pngs(args.input, outdir, use_volume=args.use_volume, mass_weighted=args.mass_weighted, prefix=args.prefix)
 
     if args.compare:
         compare_outdir = args.compare_outdir or outdir

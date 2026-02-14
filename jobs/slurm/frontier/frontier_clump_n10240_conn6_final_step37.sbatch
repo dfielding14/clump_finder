@@ -43,7 +43,7 @@ PY
 MASTER_NPZ="${OUT_DIR}/clumps_master.npz"
 MASTER_JSON="${OUT_DIR}/clumps_master.meta.json"
 STITCHED_NPZ="${OUT_DIR}/clumps_stitched.npz"
-STITCHED_PLOTS="${OUT_DIR}/stitched_plots"
+FINAL_PLOTS="${OUT_DIR}/final_plots"
 
 echo "Aggregating per-rank outputs at $(date)"
 python -u scripts/analysis/aggregate_results.py \
@@ -56,16 +56,19 @@ python -u stitch.py \
     --input "${OUT_DIR}" \
     --output "${STITCHED_NPZ}"
 
-echo "Generating comparison plots at $(date)"
-python -u scripts/analysis/plot_clumps.py \
-    --input "${MASTER_NPZ}" \
-    --outdir "${OUT_DIR}" \
-    --compare "${STITCHED_NPZ}" \
-    --compare-labels "Unstitched" "Stitched"
-
-echo "Plotting stitched catalog at $(date)"
+echo "Generating plots at $(date)"
+# Stitched catalog plots (main results)
 python -u scripts/analysis/plot_clumps.py \
     --input "${STITCHED_NPZ}" \
-    --outdir "${STITCHED_PLOTS}"
+    --outdir "${FINAL_PLOTS}" \
+    --prefix "stitched"
+
+# Unstitched catalog plots (has Minkowski data for interior clumps)
+python -u scripts/analysis/plot_clumps.py \
+    --input "${MASTER_NPZ}" \
+    --outdir "${FINAL_PLOTS}" \
+    --prefix "unstitched" \
+    --compare "${STITCHED_NPZ}" \
+    --compare-labels "Unstitched" "Stitched"
 
 echo "Done at $(date)"

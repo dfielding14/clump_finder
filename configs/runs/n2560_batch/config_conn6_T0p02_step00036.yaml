@@ -37,4 +37,4 @@ verify_one_rank_per_node: true
 # Extra-stats group control (all default to true when --extra-stats is used)
 extra_stats_moments: true    # Thermodynamic moments (rho, T, v, P)
 extra_stats_shape: true      # Covariance tensor, Euler, derived shape metrics
-extra_stats_minkowski: false # Minkowski functionals (slow, skip for now)
+extra_stats_minkowski: true  # Minkowski shapefinders (fixed curvature computation)

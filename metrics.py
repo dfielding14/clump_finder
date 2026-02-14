@@ -344,6 +344,8 @@ def derived_shape_metrics(volume: np.ndarray,
     r_eff = (3.0 * V / (4.0 * np.pi)) ** (1.0 / 3.0)
 
     # Elongation: ratio of longest to shortest axis
+    # Principal axes are already bounded by cell size at computation time,
+    # so we just need a small epsilon to avoid division by zero.
     elongation = a / (c + eps)
 
     return {
