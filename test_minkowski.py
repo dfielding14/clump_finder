@@ -70,7 +70,6 @@ def test_curvature_weights():
                   f"{weights[config]:.6f} vs {weights[complement]:.6f}")
 
     print()
-    return True
 
 
 def test_cube():
@@ -133,28 +132,39 @@ def test_sphere():
         R = radius
         expected_volume = (4/3) * np.pi * R**3
         expected_surface = 4 * np.pi * R**2
-        expected_euler = 2  # For closed surface
+        expected_euler = 1  # Simply connected 3D voxel volume
         expected_curvature = 4 * np.pi * R
+        vol_ratio = volume / expected_volume
 
         print(f"\nSphere radius {radius}:")
-        print(f"  Volume:    {volume:10.2f} (continuous: {expected_volume:.2f}, ratio: {volume/expected_volume:.3f})")
+        print(f"  Volume:    {volume:10.2f} (continuous: {expected_volume:.2f}, ratio: {vol_ratio:.3f})")
         print(f"  Surface:   {surface[0]:10.2f} (continuous: {expected_surface:.2f}, ratio: {surface[0]/expected_surface:.3f})")
         print(f"  Euler:     {euler[0]:10.2f} (expected: {expected_euler:.2f})")
         print(f"  Curvature: {curvature[0]:10.2f} (continuous: {expected_curvature:.2f}, ratio: {curvature[0]/expected_curvature:.3f})")
 
+        assert abs(euler[0] - expected_euler) < 1e-10, (
+            f"Sphere Euler mismatch for radius {radius}: got {euler[0]}, expected {expected_euler}"
+        )
+        assert 0.9 <= vol_ratio <= 1.1, (
+            f"Sphere voxelized volume out of expected range for radius {radius}: ratio={vol_ratio:.3f}"
+        )
+        assert np.isfinite(curvature[0]) and curvature[0] > 0.0, (
+            f"Sphere curvature should be finite and positive for radius {radius}: got {curvature[0]}"
+        )
+
         # Compute shapefinders
-        try:
-            sf = minkowski_shapefinders(
-                volume=np.array([volume], dtype=np.float64),
-                area=surface,
-                curvature=curvature,
-                euler_chi=euler
-            )
-            print(f"  Shapefinders: thickness={sf['thickness'][0]:.3f}, breadth={sf['breadth'][0]:.3f}, length={sf['length'][0]:.3f}")
-            print(f"                planarity={sf['planarity'][0]:.3f}, filamentarity={sf['filamentarity'][0]:.3f}")
-            print(f"  (For a sphere: P≈0, F≈0, thickness≈breadth≈length)")
-        except Exception as e:
-            print(f"  Shapefinders error: {e}")
+        sf = minkowski_shapefinders(
+            volume=np.array([volume], dtype=np.float64),
+            area=surface,
+            curvature=curvature,
+            euler_chi=euler
+        )
+        print(f"  Shapefinders: thickness={sf['thickness'][0]:.3f}, breadth={sf['breadth'][0]:.3f}, length={sf['length'][0]:.3f}")
+        print(f"                planarity={sf['planarity'][0]:.3f}, filamentarity={sf['filamentarity'][0]:.3f}")
+        print(f"  (For a sphere: P≈0, F≈0, thickness≈breadth≈length)")
+        assert np.isfinite(sf['thickness'][0]) and sf['thickness'][0] > 0.0
+        assert np.isfinite(sf['breadth'][0]) and sf['breadth'][0] > 0.0
+        assert np.isfinite(sf['length'][0]) and sf['length'][0] > 0.0
 
 
 def test_euler_lut():

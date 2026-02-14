@@ -116,16 +116,20 @@ def _slices_pbc(n: int, i0: int, i1: int, halo: int) -> List[Tuple[int, int, int
     base_lo = i0 - halo
     base_len = (i1 - i0) + 2 * halo
 
-    # Normalize to [0, n)
-    start = base_lo % n
     if base_len <= 0:
         return []
 
-    first_len = min(n - start, base_len)
-    segs = [(start, start + first_len, 0)]
-    remaining = base_len - first_len
-    if remaining > 0:
-        segs.append((0, remaining, first_len))
+    # Decompose into as many wrapped segments as needed to cover the full range.
+    segs: List[Tuple[int, int, int]] = []
+    start = base_lo % n
+    dest0 = 0
+    remaining = base_len
+    while remaining > 0:
+        take = min(n - start, remaining)
+        segs.append((start, start + take, dest0))
+        dest0 += take
+        remaining -= take
+        start = 0
     return segs
 
 

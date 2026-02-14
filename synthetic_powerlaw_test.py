@@ -199,7 +199,7 @@ def run_single_config(N, beta, anisotropy, temp_threshold, connectivity, outdir,
     temp_threshold : float
         Temperature threshold for cold gas
     connectivity : int
-        Connectivity for labeling (6 or 26)
+        Connectivity for labeling (only 6 is supported)
     outdir : str
         Output directory
     config_name : str, optional
@@ -213,6 +213,11 @@ def run_single_config(N, beta, anisotropy, temp_threshold, connectivity, outdir,
         Summary statistics for this run
     """
     import matplotlib.pyplot as plt
+
+    if connectivity != 6:
+        raise ValueError(
+            "Only connectivity=6 is supported by local_label.label_3d in this repository."
+        )
 
     dx = dy = dz = 1.0 / N
     origin = (0.0, 0.0, 0.0)
@@ -590,8 +595,8 @@ Examples:
                     help='Power spectrum slope (default -5/3 Kolmogorov)')
     ap.add_argument('--temp-threshold', type=float, default=0.1,
                     help='Temperature threshold for cold gas (default 0.1)')
-    ap.add_argument('--connectivity', type=int, default=6,
-                    help='Connectivity for labeling: 6 or 26')
+    ap.add_argument('--connectivity', type=int, default=6, choices=[6],
+                    help='Connectivity for labeling (only 6 is supported)')
     ap.add_argument('--outdir', default='./clump_out_synth',
                     help='Output directory')
     ap.add_argument('--anisotropy', type=float, nargs=3, default=None,

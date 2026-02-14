@@ -303,7 +303,7 @@ def derived_shape_metrics(volume: np.ndarray,
     dict with keys:
         triaxiality : (K,) - T = (a² - b²) / (a² - c² + eps), 0=oblate, 1=prolate
         sphericity : (K,) - isoperimetric ratio, 1 for perfect sphere
-        compactness : (K,) - V / S^1.5, dimensionless
+        compactness : (K,) - normalized isoperimetric compactness 36*pi*V^2/S^3 (1 for sphere)
         r_eff : (K,) - effective spherical radius
         elongation : (K,) - a / c ratio
     """
@@ -337,8 +337,9 @@ def derived_shape_metrics(volume: np.ndarray,
     # sphericity = (π^(1/3) * (6V)^(2/3)) / S = 1 for sphere
     sphericity = (np.pi ** (1.0 / 3.0) * (6.0 * V) ** (2.0 / 3.0)) / (S + eps)
 
-    # Compactness: dimensionless V/S^1.5
-    compactness = V / (S ** 1.5 + eps)
+    # Compactness: normalized isoperimetric compactness.
+    # This equals 1 for a perfect sphere and <= 1 for all closed surfaces.
+    compactness = 36.0 * np.pi * V * V / (S * S * S + eps)
 
     # Effective radius: radius of sphere with same volume
     r_eff = (3.0 * V / (4.0 * np.pi)) ** (1.0 / 3.0)
@@ -2085,4 +2086,3 @@ def measure_2d_slice(mask: np.ndarray, dx: float = 1.0, dy: float = 1.0,
         'component_perimeters': component_perimeters_crack,
         'component_solidities': component_solidities
     }
-

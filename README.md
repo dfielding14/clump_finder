@@ -12,7 +12,7 @@ The driver follows a simple but memory‑aware pipeline so we can work on Fronti
 
 3. **Labeling.** `local_label.py` runs a Numba‑accelerated 3‑D connected components on the full tile (including halo). For production and stitched runs, connectivity is fixed to 6‑connected (face neighbors); 18/26‑connected options are disabled to avoid incorrect cross‑tile merges.
 
-4. **Filtering.** We drop labels smaller than `min_clump_cells` (default 4³). This avoids filling the catalog with noise while keeping the main statistics stable.
+4. **Filtering.** For stitched workflows, we defer `min_clump_cells` until after global stitching so small bridge fragments are not removed before cross-rank merges. This avoids breaking topology at tile boundaries.
 
 5. **Metrics and statistics.** `metrics.py` reduces per‑label quantities: cell counts, volumes/masses, exposed surface area, centroids, velocity statistics, and principal axes. We ingest data as float32 to save RAM, but accumulations (weights, covariances) stay in float64 to preserve accuracy on large tiles.
 
@@ -117,6 +117,18 @@ Use `python scripts/analysis/plot_clumps.py --input <npz> --outdir <png_dir> [--
 - Additional studies live under `scripts/analysis/`: correlation heatmaps (`analyze_correlations.py`), PCA/FA (`analyze_pca.py`), and embedding/clustering (`analyze_embedding.py`).
 - By default these tools work with the always-emitted fields (`volume`, `mass`, `area`, `cell_count`, `velocity_std`, `velocity_mean`).
 - To revisit the full thermodynamic feature set (density/pressure moments, velocity components, etc.), rerun `clump_finder.py` with `--extra-stats` or set `extra_stats: true` in the YAML config so those arrays are present in `clumps_master.npz`.
+
+## Synthetic Stitch Regression
+
+We include a dedicated periodic single-cloud stitching test that builds synthetic `N x N x N` volumes containing exactly one cloud (sphere or ellipsoid), partitions into many chunk layouts, then verifies stitched output returns a single clump.
+
+- Fast matrix (default): `pytest -q tests/test_stitch_single_cloud.py`
+- Larger representative runs (`N=256`): `pytest -q --run-large tests/test_stitch_single_cloud.py`
+- Stress runs (`N=512`): `pytest -q --run-stress tests/test_stitch_single_cloud.py`
+- Custom sweep driver:
+```
+python scripts/testing/run_stitch_cloud_sweep.py --N 64 256 512 --shape both --partitions 1x1x1,2x2x2,4x2x2 --keep-failures ./clump_out/stitch_sweep_failures
+```
 
 ## Notes
 

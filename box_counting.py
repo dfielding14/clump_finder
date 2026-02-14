@@ -262,16 +262,17 @@ def analyze_largest_clumps(labels: np.ndarray,
     """
     from scipy import ndimage
 
-    # Find all unique clump IDs (excluding background)
-    unique_ids = np.unique(labels)
-    unique_ids = unique_ids[unique_ids > 0]
-
-    if len(unique_ids) == 0:
+    labels = np.asarray(labels)
+    if labels.size == 0:
         return {'valid': False, 'reason': 'no_clumps'}
 
-    # Calculate volumes
-    volumes = ndimage.sum_labels(np.ones_like(labels), labels, unique_ids)
-    volumes = np.array(volumes)
+    # Compute label volumes in one pass (avoids allocating ones_like(labels)).
+    max_label = int(labels.max())
+    if max_label <= 0:
+        return {'valid': False, 'reason': 'no_clumps'}
+    counts = np.bincount(labels.ravel().astype(np.int64, copy=False), minlength=max_label + 1).astype(np.int64)
+    unique_ids = np.nonzero(counts[1:] > 0)[0] + 1
+    volumes = counts[unique_ids]
 
     # Filter by minimum volume
     valid_mask = volumes >= min_volume
@@ -285,6 +286,10 @@ def analyze_largest_clumps(labels: np.ndarray,
     sort_idx = np.argsort(valid_volumes)[::-1]
     selected_ids = valid_ids[sort_idx[:n_clumps]]
     selected_volumes = valid_volumes[sort_idx[:n_clumps]]
+
+    # Precompute bounding slices for each label once; this avoids O(n_clumps * N^3)
+    # full-domain scans when extracting each clump's subvolume.
+    object_slices = ndimage.find_objects(labels)
 
     if verbose:
         mode = "SURFACE" if surface_only else "VOLUME"
@@ -307,18 +312,25 @@ def analyze_largest_clumps(labels: np.ndarray,
         if verbose:
             print(f"  Clump {cid} (volume={vol} voxels)...")
 
-        # Extract mask for this clump
-        mask = (labels == cid)
-
-        # Find bounding box
-        where = np.argwhere(mask)
-        bb_min = where.min(axis=0)
-        bb_max = where.max(axis=0) + 1
-
-        # Extract submask (for efficiency)
-        submask = mask[bb_min[0]:bb_max[0],
-                       bb_min[1]:bb_max[1],
-                       bb_min[2]:bb_max[2]]
+        cid_int = int(cid)
+        slc = object_slices[cid_int - 1] if 0 < cid_int <= len(object_slices) else None
+        if slc is None:
+            # Robust fallback for sparse/non-standard label IDs.
+            mask = (labels == cid_int)
+            where = np.argwhere(mask)
+            if where.size == 0:
+                if verbose:
+                    print("    Skipping: no voxels found for label")
+                continue
+            bb_min = where.min(axis=0)
+            bb_max = where.max(axis=0) + 1
+            submask = mask[bb_min[0]:bb_max[0],
+                           bb_min[1]:bb_max[1],
+                           bb_min[2]:bb_max[2]]
+        else:
+            bb_min = np.array([slc[0].start, slc[1].start, slc[2].start], dtype=np.int64)
+            bb_max = np.array([slc[0].stop, slc[1].stop, slc[2].stop], dtype=np.int64)
+            submask = (labels[slc] == cid_int)
 
         # Determine max box size from bounding box
         bb_size = bb_max - bb_min

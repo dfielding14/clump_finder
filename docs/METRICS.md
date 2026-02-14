@@ -137,10 +137,10 @@ c/a = shortest / longest        (0 to 1)
 ### Compactness
 
 ```
-compactness = V / A^(3/2)
+compactness = 36π V² / A³
 ```
 
-Dimensionless measure of how "compact" vs "spread out" the shape is.
+Normalized isoperimetric compactness. This equals 1 for a sphere and is < 1 for less compact shapes.
 
 ### Effective Radius
 

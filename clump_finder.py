@@ -62,6 +62,12 @@ def main():
 
     # Grid resolution and spacing
     N = int(cfg.get("Nres", 0))
+    periodic_cfg = cfg.get("periodic", [True, True, True])
+    if len(periodic_cfg) != 3:
+        raise ValueError("periodic must be a length-3 sequence")
+    periodic = tuple(bool(x) for x in periodic_cfg)
+    if periodic != (True, True, True):
+        raise ValueError("Only fully periodic domains are supported: periodic must be [true, true, true]")
     # Optionally assert/override from data (rank 0)
     if cfg.get("assert_nres_from_data", False):
         if rank == 0:
@@ -85,9 +91,9 @@ def main():
         dx = dy = dz = 1.0 / N
     origin = tuple(cfg.get("origin", [0.0, 0.0, 0.0]))
 
-    # Cartesian decomposition (periodic on all axes)
+    # Cartesian decomposition (fully periodic only)
     px, py, pz = compute_dims(size)
-    cart = comm.Create_cart(dims=(px, py, pz), periods=(True, True, True), reorder=False)
+    cart = comm.Create_cart(dims=(px, py, pz), periods=periodic, reorder=False)
     coords = cart.Get_coords(rank)
     i0, i1 = split_axis(N, px, coords[0])
     j0, j1 = split_axis(N, py, coords[1])
@@ -529,7 +535,7 @@ def main():
         "temperature_threshold": np.float64(thr if cut_by == "temperature" else cfg.get("temperature_threshold", np.nan)),
         "rank": np.int32(rank),
         "node_bbox_ijk": np.array([i0, i1, j0, j1, k0, k1], dtype=np.int64),
-        "periodic": np.array([True, True, True], dtype=bool),
+        "periodic": np.array(periodic, dtype=bool),
         "overlap_width": np.int32(overlap_width),
         "ovlp_xneg": ovlp_xneg,
         "ovlp_xpos": ovlp_xpos,
@@ -581,7 +587,7 @@ def main():
             "Nres": int(N),
             "dx": float(dx), "dy": float(dy), "dz": float(dz),
             "origin": list(origin),
-            "periodic": [True, True, True],
+            "periodic": list(periodic),
         },
         "labeling": {
             "tile_shape": list(tile_shape),

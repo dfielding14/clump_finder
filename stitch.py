@@ -11,7 +11,7 @@ import argparse
 import glob
 import json
 import os
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 
@@ -67,20 +67,37 @@ def index_parts(input_dir: str):
         raise FileNotFoundError("No clumps_rank*.meta.json")
     ranks = {}
     cart_dims = None
-    periodic = (True, True, True)
+    periodic = None
+    seen_coords = set()
     for m in metas:
         d = _load_meta(m)
         r = int(d["rank"])
+        if r in ranks:
+            raise ValueError(f"Duplicate rank metadata encountered: rank={r}")
+        min_cells_deferred = int(d.get("stitching", {}).get("min_clump_cells_deferred", 1))
+        coords = tuple(d["coords"])
+        if coords in seen_coords:
+            raise ValueError(f"Duplicate Cartesian coordinates in metadata: coords={coords}")
+        seen_coords.add(coords)
+        dims = tuple(d["cart_dims"])
+        if cart_dims is None:
+            cart_dims = dims
+        elif cart_dims != dims:
+            raise ValueError(f"Inconsistent cart_dims across rank metadata: {cart_dims} vs {dims}")
+        p_here = tuple(bool(x) for x in d.get("grid", {}).get("periodic", (True, True, True)))
+        if periodic is None:
+            periodic = p_here
+        elif periodic != p_here:
+            raise ValueError(f"Inconsistent periodic flags across rank metadata: {periodic} vs {p_here}")
         ranks[r] = {
-            "coords": tuple(d["coords"]),
+            "coords": coords,
             "bbox": tuple(d["node_bbox_ijk"]),
             "npz": os.path.join(input_dir, d["output_npz"]),
             "meta": m,
+            "min_clump_cells_deferred": min_cells_deferred,
         }
-        if cart_dims is None:
-            cart_dims = tuple(d["cart_dims"])
-        if "grid" in d and "periodic" in d["grid"]:
-            periodic = tuple(bool(x) for x in d["grid"]["periodic"])
+    if periodic is None:
+        periodic = (True, True, True)
     return ranks, cart_dims, periodic
 
 
@@ -91,6 +108,14 @@ def build_edges(ranks: dict,
     dsu = DSU()
     edge_counts = {"x": {}, "y": {}, "z": {}}  # dict[(gid_a,gid_b)] = count
     by_coords = {tuple(v["coords"]): r for r, v in ranks.items()}
+    cache: Dict[int, Dict[str, np.ndarray]] = {}
+
+    def load_part(rank_id: int) -> Dict[str, np.ndarray]:
+        d = cache.get(rank_id)
+        if d is None:
+            d = _load_npz(ranks[rank_id]["npz"])
+            cache[rank_id] = d
+        return d
 
     def add_edges(axis_key: str, r: int, rn: int, a: np.ndarray, b: np.ndarray):
         mask = (a > 0) & (b > 0)
@@ -106,25 +131,25 @@ def build_edges(ranks: dict,
             edge_counts[axis_key][key] = edge_counts[axis_key].get(key, 0) + 1
 
     for r, info in ranks.items():
-        npz = _load_npz(info["npz"])
+        npz = load_part(r)
         coords = tuple(info["coords"])
 
         ncoords = _neighbor(coords, cart_dims, axis=0, sign=+1, periodic=periodic)
         if ncoords is not None:
             rn = by_coords[ncoords]
-            npz_n = _load_npz(ranks[rn]["npz"])
+            npz_n = load_part(rn)
             add_edges("x", r, rn, npz["face_xpos"], npz_n["face_xneg"])
 
         ncoords = _neighbor(coords, cart_dims, axis=1, sign=+1, periodic=periodic)
         if ncoords is not None:
             rn = by_coords[ncoords]
-            npz_n = _load_npz(ranks[rn]["npz"])
+            npz_n = load_part(rn)
             add_edges("y", r, rn, npz["face_ypos"], npz_n["face_yneg"])
 
         ncoords = _neighbor(coords, cart_dims, axis=2, sign=+1, periodic=periodic)
         if ncoords is not None:
             rn = by_coords[ncoords]
-            npz_n = _load_npz(ranks[rn]["npz"])
+            npz_n = load_part(rn)
             add_edges("z", r, rn, npz["face_zpos"], npz_n["face_zneg"])
 
     face_area = {"x": dy * dz, "y": dx * dz, "z": dx * dy}
@@ -176,18 +201,33 @@ def _merge_by_overlap_planes(ranks: dict,
 
 
 def _combine_weighted_stats(G: int, parts: Dict, roots: dict, root_to_idx: dict,
-                             stat_name: str, weight_key: str = "cell_count"):
+                             stat_name: str | None = None, weight_key: str = "cell_count",
+                             mean_key: str | None = None, std_key: str | None = None):
     """Combine weighted mean and std across ranks using parallel variance formula.
 
     Returns (mean, std) arrays of shape (G,).
     """
-    mean_key = f"{stat_name}_mean"
-    std_key = f"{stat_name}_std"
+    if mean_key is None:
+        if stat_name is None:
+            raise ValueError("Either stat_name or mean_key/std_key must be provided")
+        mean_key = f"{stat_name}_mean"
+    if std_key is None:
+        if stat_name is None:
+            raise ValueError("Either stat_name or mean_key/std_key must be provided")
+        std_key = f"{stat_name}_std"
 
-    # Check if this stat exists
-    sample = next(iter(parts.values()))
-    if mean_key not in sample:
+    have_pair = {r: (mean_key in d and std_key in d) for r, d in parts.items()}
+    if not any(have_pair.values()):
         return None, None
+    if not all(have_pair.values()):
+        missing_ranks = sorted(r for r, ok in have_pair.items() if not ok)
+        raise ValueError(
+            f"Inconsistent statistics fields '{mean_key}/{std_key}' across ranks; "
+            f"missing on ranks {missing_ranks}"
+        )
+    missing_weights = sorted(r for r, d in parts.items() if weight_key not in d)
+    if missing_weights:
+        raise ValueError(f"Missing required weight field '{weight_key}' on ranks {missing_weights}")
 
     # Accumulators: sum of weights, sum of weighted values, sum of weighted squared values
     W = np.zeros(G, dtype=np.float64)
@@ -216,8 +256,39 @@ def _combine_weighted_stats(G: int, parts: Dict, roots: dict, root_to_idx: dict,
     return mean, std
 
 
+def _uniform_key_presence(parts: Dict[int, Dict[str, np.ndarray]], key: str) -> bool:
+    """Return True if key exists on all parts, False if absent on all, else raise."""
+    present = sorted(r for r, d in parts.items() if key in d)
+    if not present:
+        return False
+    if len(present) != len(parts):
+        missing = sorted(r for r in parts if r not in present)
+        raise ValueError(f"Inconsistent optional field '{key}' across ranks; missing on ranks {missing}")
+    return True
+
+
+def _uniform_group_presence(parts: Dict[int, Dict[str, np.ndarray]], keys: Iterable[str],
+                            group_name: str) -> bool:
+    """Return True if all keys exist on all parts, False if absent on all, else raise."""
+    keys = tuple(keys)
+    fully_present = sorted(r for r, d in parts.items() if all(k in d for k in keys))
+    if not fully_present:
+        if any(any(k in d for k in keys) for d in parts.values()):
+            bad = sorted(r for r, d in parts.items() if any(k in d for k in keys) and not all(k in d for k in keys))
+            raise ValueError(f"Incomplete {group_name} fields on ranks {bad}; expected keys={keys}")
+        return False
+    if len(fully_present) != len(parts):
+        missing = sorted(r for r in parts if r not in fully_present)
+        raise ValueError(f"Inconsistent {group_name} fields across ranks; missing on ranks {missing}")
+    return True
+
+
 def stitch_reduce(input_dir: str, output_path: str):
     ranks, cart_dims, periodic = index_parts(input_dir)
+    deferred_values = sorted({int(info.get("min_clump_cells_deferred", 1)) for info in ranks.values()})
+    if len(deferred_values) > 1:
+        raise ValueError(f"Inconsistent min_clump_cells_deferred across rank metadata: {deferred_values}")
+    min_clump_cells = deferred_values[0] if deferred_values else 1
     any_npz = _load_npz(next(iter(ranks.values()))["npz"])
     dx, dy, dz = (float(any_npz["voxel_spacing"][0]),
                   float(any_npz["voxel_spacing"][1]),
@@ -230,10 +301,44 @@ def stitch_reduce(input_dir: str, output_path: str):
     parts: Dict[int, Dict[str, np.ndarray]] = {}
     for r, info in ranks.items():
         d = _load_npz(info["npz"])
+        if "voxel_spacing" not in d:
+            raise KeyError(f"Missing required field 'voxel_spacing' in {info['npz']}")
+        spacing = np.asarray(d["voxel_spacing"], dtype=np.float64).ravel()
+        if spacing.shape[0] < 3:
+            raise ValueError(f"Invalid voxel_spacing shape in {info['npz']}: {spacing.shape}")
+        if not np.allclose(spacing[:3], np.array([dx, dy, dz], dtype=np.float64), rtol=0.0, atol=1e-12):
+            raise ValueError(
+                f"Inconsistent voxel_spacing across parts: expected {[dx, dy, dz]}, "
+                f"rank {r} has {spacing[:3].tolist()}"
+            )
         lids = d["label_ids"].astype(np.int64)
         gids = (_gid(r, 0) + lids.astype(np.uint64))
         all_gids.extend(list(gids))
         parts[r] = d
+
+    cov_base_keys = ("cov_W", "cov_Sx", "cov_Sy", "cov_Sz", "cov_Sxx", "cov_Syy", "cov_Szz")
+    cov_cross_keys = ("cov_Sxy", "cov_Sxz", "cov_Syz")
+    has_cov_base = _uniform_group_presence(parts, cov_base_keys, "covariance-base")
+    has_cov_cross = _uniform_group_presence(parts, cov_cross_keys, "covariance-cross")
+    if has_cov_cross and not has_cov_base:
+        raise ValueError("Found covariance cross terms without covariance base terms")
+    # Legacy principal-axis fallback is only relevant when covariance sums are unavailable.
+    has_legacy_axes = _uniform_key_presence(parts, "principal_axes_lengths") if not has_cov_base else False
+    has_euler = _uniform_key_presence(parts, "euler_characteristic")
+    has_shape_stats = has_cov_base or has_legacy_axes
+
+    global_i0 = min(int(info["bbox"][0]) for info in ranks.values())
+    global_i1 = max(int(info["bbox"][1]) for info in ranks.values())
+    global_j0 = min(int(info["bbox"][2]) for info in ranks.values())
+    global_j1 = max(int(info["bbox"][3]) for info in ranks.values())
+    global_k0 = min(int(info["bbox"][4]) for info in ranks.values())
+    global_k1 = max(int(info["bbox"][5]) for info in ranks.values())
+    domain_cells = np.array([global_i1 - global_i0, global_j1 - global_j0, global_k1 - global_k0], dtype=np.float64)
+    domain_lengths = domain_cells * np.array([dx, dy, dz], dtype=np.float64)
+    origin = np.asarray(any_npz.get("origin", np.zeros(3, dtype=np.float64)), dtype=np.float64).ravel()
+    if origin.size < 3:
+        origin = np.pad(origin, (0, 3 - origin.size), mode="constant")
+    domain_start = origin[:3] + np.array([global_i0 * dx, global_j0 * dy, global_k0 * dz], dtype=np.float64)
 
     roots = {g: dsu.find(g) for g in all_gids}
     uniq_roots = sorted(set(roots.values()))
@@ -247,9 +352,6 @@ def stitch_reduce(input_dir: str, output_path: str):
         stitched_count[root_to_idx[roots[g]]] += 1
     is_stitched = stitched_count > 1  # True if clump spans multiple ranks
 
-    # Check if extra stats are available (velocity moments OR covariance data)
-    has_extra_stats = "vx_mean" in any_npz or "cov_W" in any_npz
-
     cell_count = np.zeros(G, dtype=np.int64)
     volume = np.zeros(G, dtype=np.float64)
     mass = np.zeros(G, dtype=np.float64)
@@ -259,6 +361,18 @@ def stitch_reduce(input_dir: str, output_path: str):
     Sxm = np.zeros(G, dtype=np.float64)
     Sym = np.zeros(G, dtype=np.float64)
     Szm = np.zeros(G, dtype=np.float64)
+    Sxv_cos = np.zeros(G, dtype=np.float64)
+    Syv_cos = np.zeros(G, dtype=np.float64)
+    Szv_cos = np.zeros(G, dtype=np.float64)
+    Sxv_sin = np.zeros(G, dtype=np.float64)
+    Syv_sin = np.zeros(G, dtype=np.float64)
+    Szv_sin = np.zeros(G, dtype=np.float64)
+    Sxm_cos = np.zeros(G, dtype=np.float64)
+    Sym_cos = np.zeros(G, dtype=np.float64)
+    Szm_cos = np.zeros(G, dtype=np.float64)
+    Sxm_sin = np.zeros(G, dtype=np.float64)
+    Sym_sin = np.zeros(G, dtype=np.float64)
+    Szm_sin = np.zeros(G, dtype=np.float64)
     bbox = np.zeros((G, 6), dtype=np.int64)
     bbox[:, 0::2] = np.iinfo(np.int64).max
     bbox[:, 1::2] = np.iinfo(np.int64).min
@@ -266,10 +380,11 @@ def stitch_reduce(input_dir: str, output_path: str):
     speed_w = np.zeros(G, dtype=np.float64)
     speed_w2 = np.zeros(G, dtype=np.float64)
 
-    # Extra stats accumulators (if available)
-    if has_extra_stats:
+    if has_euler:
         euler_chi = np.zeros(G, dtype=np.int64)
-        # Covariance tensor sums (mass-weighted)
+    if has_shape_stats:
+        # Covariance tensor sums (mass-weighted). For legacy fallback these are
+        # reconstructed approximately from principal axes.
         cov_W = np.zeros(G, dtype=np.float64)
         cov_Sx = np.zeros(G, dtype=np.float64)
         cov_Sy = np.zeros(G, dtype=np.float64)
@@ -308,6 +423,27 @@ def stitch_reduce(input_dir: str, output_path: str):
         np.add.at(Sxm, idx, cm[:, 0] * ms)
         np.add.at(Sym, idx, cm[:, 1] * ms)
         np.add.at(Szm, idx, cm[:, 2] * ms)
+        if periodic[0] and domain_lengths[0] > 0.0:
+            theta_v = 2.0 * np.pi * (cv[:, 0] - domain_start[0]) / domain_lengths[0]
+            theta_m = 2.0 * np.pi * (cm[:, 0] - domain_start[0]) / domain_lengths[0]
+            np.add.at(Sxv_cos, idx, vol * np.cos(theta_v))
+            np.add.at(Sxv_sin, idx, vol * np.sin(theta_v))
+            np.add.at(Sxm_cos, idx, ms * np.cos(theta_m))
+            np.add.at(Sxm_sin, idx, ms * np.sin(theta_m))
+        if periodic[1] and domain_lengths[1] > 0.0:
+            theta_v = 2.0 * np.pi * (cv[:, 1] - domain_start[1]) / domain_lengths[1]
+            theta_m = 2.0 * np.pi * (cm[:, 1] - domain_start[1]) / domain_lengths[1]
+            np.add.at(Syv_cos, idx, vol * np.cos(theta_v))
+            np.add.at(Syv_sin, idx, vol * np.sin(theta_v))
+            np.add.at(Sym_cos, idx, ms * np.cos(theta_m))
+            np.add.at(Sym_sin, idx, ms * np.sin(theta_m))
+        if periodic[2] and domain_lengths[2] > 0.0:
+            theta_v = 2.0 * np.pi * (cv[:, 2] - domain_start[2]) / domain_lengths[2]
+            theta_m = 2.0 * np.pi * (cm[:, 2] - domain_start[2]) / domain_lengths[2]
+            np.add.at(Szv_cos, idx, vol * np.cos(theta_v))
+            np.add.at(Szv_sin, idx, vol * np.sin(theta_v))
+            np.add.at(Szm_cos, idx, ms * np.cos(theta_m))
+            np.add.at(Szm_sin, idx, ms * np.sin(theta_m))
 
         bb = d["bbox_ijk"].astype(np.int64)
         np.minimum.at(bbox[:, 0], idx, bb[:, 0])
@@ -317,14 +453,11 @@ def stitch_reduce(input_dir: str, output_path: str):
         np.maximum.at(bbox[:, 3], idx, bb[:, 3])
         np.maximum.at(bbox[:, 5], idx, bb[:, 5])
 
-        # Extra stats
-        if has_extra_stats:
-            if "euler_characteristic" in d:
-                np.add.at(euler_chi, idx, d["euler_characteristic"].astype(np.int64))
+        if has_euler:
+            np.add.at(euler_chi, idx, d["euler_characteristic"].astype(np.int64))
 
-            # Accumulate raw covariance tensor sums (if available)
-            if "cov_W" in d:
-                # New format: raw sums stored directly
+        if has_shape_stats:
+            if has_cov_base:
                 np.add.at(cov_W, idx, d["cov_W"].astype(np.float64))
                 np.add.at(cov_Sx, idx, d["cov_Sx"].astype(np.float64))
                 np.add.at(cov_Sy, idx, d["cov_Sy"].astype(np.float64))
@@ -332,10 +465,11 @@ def stitch_reduce(input_dir: str, output_path: str):
                 np.add.at(cov_Sxx, idx, d["cov_Sxx"].astype(np.float64))
                 np.add.at(cov_Syy, idx, d["cov_Syy"].astype(np.float64))
                 np.add.at(cov_Szz, idx, d["cov_Szz"].astype(np.float64))
-                np.add.at(cov_Sxy, idx, d["cov_Sxy"].astype(np.float64))
-                np.add.at(cov_Sxz, idx, d["cov_Sxz"].astype(np.float64))
-                np.add.at(cov_Syz, idx, d["cov_Syz"].astype(np.float64))
-            elif "principal_axes_lengths" in d:
+                if has_cov_cross:
+                    np.add.at(cov_Sxy, idx, d["cov_Sxy"].astype(np.float64))
+                    np.add.at(cov_Sxz, idx, d["cov_Sxz"].astype(np.float64))
+                    np.add.at(cov_Syz, idx, d["cov_Syz"].astype(np.float64))
+            else:
                 # Legacy fallback: approximate from principal axes (inaccurate for stitched)
                 np.add.at(cov_W, idx, ms)
                 np.add.at(cov_Sx, idx, cm[:, 0] * ms)
@@ -362,6 +496,33 @@ def stitch_reduce(input_dir: str, output_path: str):
     centroid_mass = np.stack([Sxm / (mass + small),
                               Sym / (mass + small),
                               Szm / (mass + small)], axis=1)
+    if periodic[0] and domain_lengths[0] > 0.0:
+        ang_v = np.arctan2(Sxv_sin, Sxv_cos)
+        ang_m = np.arctan2(Sxm_sin, Sxm_cos)
+        cand_v = domain_start[0] + np.mod(ang_v, 2.0 * np.pi) * (domain_lengths[0] / (2.0 * np.pi))
+        cand_m = domain_start[0] + np.mod(ang_m, 2.0 * np.pi) * (domain_lengths[0] / (2.0 * np.pi))
+        unambig_v = np.hypot(Sxv_cos, Sxv_sin) > (1e-12 * (volume + small))
+        unambig_m = np.hypot(Sxm_cos, Sxm_sin) > (1e-12 * (mass + small))
+        centroid_vol[:, 0] = np.where(unambig_v, cand_v, centroid_vol[:, 0])
+        centroid_mass[:, 0] = np.where(unambig_m, cand_m, centroid_mass[:, 0])
+    if periodic[1] and domain_lengths[1] > 0.0:
+        ang_v = np.arctan2(Syv_sin, Syv_cos)
+        ang_m = np.arctan2(Sym_sin, Sym_cos)
+        cand_v = domain_start[1] + np.mod(ang_v, 2.0 * np.pi) * (domain_lengths[1] / (2.0 * np.pi))
+        cand_m = domain_start[1] + np.mod(ang_m, 2.0 * np.pi) * (domain_lengths[1] / (2.0 * np.pi))
+        unambig_v = np.hypot(Syv_cos, Syv_sin) > (1e-12 * (volume + small))
+        unambig_m = np.hypot(Sym_cos, Sym_sin) > (1e-12 * (mass + small))
+        centroid_vol[:, 1] = np.where(unambig_v, cand_v, centroid_vol[:, 1])
+        centroid_mass[:, 1] = np.where(unambig_m, cand_m, centroid_mass[:, 1])
+    if periodic[2] and domain_lengths[2] > 0.0:
+        ang_v = np.arctan2(Szv_sin, Szv_cos)
+        ang_m = np.arctan2(Szm_sin, Szm_cos)
+        cand_v = domain_start[2] + np.mod(ang_v, 2.0 * np.pi) * (domain_lengths[2] / (2.0 * np.pi))
+        cand_m = domain_start[2] + np.mod(ang_m, 2.0 * np.pi) * (domain_lengths[2] / (2.0 * np.pi))
+        unambig_v = np.hypot(Szv_cos, Szv_sin) > (1e-12 * (volume + small))
+        unambig_m = np.hypot(Szm_cos, Szm_sin) > (1e-12 * (mass + small))
+        centroid_vol[:, 2] = np.where(unambig_v, cand_v, centroid_vol[:, 2])
+        centroid_mass[:, 2] = np.where(unambig_m, cand_m, centroid_mass[:, 2])
     speed_mean = speed_w / (cell_count + small)
     speed_var = speed_w2 / (cell_count + small) - speed_mean * speed_mean
     np.maximum(speed_var, 0.0, out=speed_var)
@@ -385,32 +546,36 @@ def stitch_reduce(input_dir: str, output_path: str):
         "n_fragments": stitched_count,  # Number of local labels that were merged
     }
 
-    # Add extra stats if available
-    if has_extra_stats:
-        # Component-wise velocity (volume-weighted)
-        for comp in ["vx", "vy", "vz"]:
-            mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, comp, "volume")
-            if mu is not None:
-                out[f"{comp}_mean"] = mu
-                out[f"{comp}_std"] = sigma
+    # Component-wise velocity (volume-weighted)
+    for comp in ["vx", "vy", "vz"]:
+        mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, comp, "volume")
+        if mu is not None:
+            out[f"{comp}_mean"] = mu
+            out[f"{comp}_std"] = sigma
 
-        # Thermodynamic stats (volume-weighted)
-        for stat in ["rho", "T", "pressure"]:
-            mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, stat, "volume")
-            if mu is not None:
-                out[f"{stat}_mean"] = mu
-                out[f"{stat}_std"] = sigma
+    # Thermodynamic stats (volume-weighted)
+    for stat in ["rho", "T", "pressure"]:
+        mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, stat, "volume")
+        if mu is not None:
+            out[f"{stat}_mean"] = mu
+            out[f"{stat}_std"] = sigma
 
-        # Mass-weighted versions
-        for stat in ["rho", "T", "vx", "vy", "vz", "pressure"]:
-            mu, sigma = _combine_weighted_stats(G, parts, roots, root_to_idx, f"{stat}_massw", "mass")
-            if mu is not None:
-                out[f"{stat}_mean_massw"] = mu
-                out[f"{stat}_std_massw"] = sigma
+    # Mass-weighted versions
+    for stat in ["rho", "T", "vx", "vy", "vz", "pressure"]:
+        mu, sigma = _combine_weighted_stats(
+            G, parts, roots, root_to_idx,
+            weight_key="mass",
+            mean_key=f"{stat}_mean_massw",
+            std_key=f"{stat}_std_massw",
+        )
+        if mu is not None:
+            out[f"{stat}_mean_massw"] = mu
+            out[f"{stat}_std_massw"] = sigma
 
-        # Euler characteristic (additive)
+    if has_euler:
         out["euler_characteristic"] = euler_chi
 
+    if has_shape_stats:
         # Compute combined principal axes from covariance sums
         mu_x = cov_Sx / (cov_W + small)
         mu_y = cov_Sy / (cov_W + small)
@@ -422,12 +587,12 @@ def stitch_reduce(input_dir: str, output_path: str):
         Cxz = cov_Sxz / (cov_W + small) - mu_x * mu_z
         Cyz = cov_Syz / (cov_W + small) - mu_y * mu_z
 
-        # Check if we have full covariance data (new format with cov_Sxy etc.)
-        has_full_cov = np.any(cov_Sxy != 0) or np.any(cov_Sxz != 0) or np.any(cov_Syz != 0)
+        has_full_cov = has_cov_base and has_cov_cross
 
         principal_axes_lengths = np.zeros((G, 3), dtype=np.float64)
         axis_ratios = np.zeros((G, 2), dtype=np.float64)
         orientation = np.zeros((G, 3, 3), dtype=np.float64)
+        shape_metrics_valid = np.ones(G, dtype=bool) if has_full_cov else ~is_stitched
 
         for i in range(G):
             if has_full_cov:
@@ -440,12 +605,16 @@ def stitch_reduce(input_dir: str, output_path: str):
                 if not np.all(np.isfinite(C)):
                     principal_axes_lengths[i] = (np.nan, np.nan, np.nan)
                     axis_ratios[i] = (np.nan, np.nan)
+                    orientation[i] = np.eye(3)
+                    shape_metrics_valid[i] = False
                     continue
                 try:
                     vals, vecs = np.linalg.eigh(C)
                 except np.linalg.LinAlgError:
                     principal_axes_lengths[i] = (np.nan, np.nan, np.nan)
                     axis_ratios[i] = (np.nan, np.nan)
+                    orientation[i] = np.eye(3)
+                    shape_metrics_valid[i] = False
                     continue
                 order = np.argsort(vals)[::-1]
                 vals = vals[order]
@@ -502,8 +671,7 @@ def stitch_reduce(input_dir: str, output_path: str):
         if has_full_cov:
             out["orientation"] = orientation
 
-        # Shape metrics are now valid for all clumps if we have full covariance data
-        out["shape_metrics_valid"] = np.ones(G, dtype=bool) if has_full_cov else ~is_stitched
+        out["shape_metrics_valid"] = shape_metrics_valid
 
         # Derived shape metrics
         r_eff = (3.0 * volume / (4.0 * np.pi)) ** (1.0 / 3.0)
@@ -528,6 +696,18 @@ def stitch_reduce(input_dir: str, output_path: str):
         # proper shapefinders (breadth, length, planarity, filamentarity).
         # Euler characteristic is kept for reference but integrated curvature
         # requires voxel-level boundary information not preserved through stitching.
+
+    # Apply deferred min_clump_cells filtering after global stitching.
+    n_before_min_cells = int(out["gid"].shape[0])
+    out["min_clump_cells_deferred"] = np.int32(min_clump_cells)
+    if min_clump_cells > 1:
+        keep = out["cell_count"] >= int(min_clump_cells)
+        for key, val in list(out.items()):
+            if isinstance(val, np.ndarray) and val.shape[:1] == (n_before_min_cells,):
+                out[key] = val[keep]
+    out["min_clump_cells_applied"] = np.int32(min_clump_cells)
+    out["n_before_min_cells"] = np.int32(n_before_min_cells)
+    out["n_after_min_cells"] = np.int32(int(out["gid"].shape[0]))
 
     # Write everything to single output file
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
